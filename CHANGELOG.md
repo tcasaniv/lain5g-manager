@@ -2,7 +2,7 @@
 
 All notable changes to lain5g-manager are documented here.
 
-## [1.1.7] - 2024-11
+## [1.1.7] - 2026-11-05
 
 ### Added
 - Initial release compatible with OpenLain5G 1.1.7
