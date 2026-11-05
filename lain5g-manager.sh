@@ -21,6 +21,11 @@ INSTALLED=false
 VERSION_STR="no instalado"
 GIT_REF="—"
 RUNNING_PROJECTS=()
+DOCKER_ACCESS="missing"
+
+has_docker() {
+  command -v docker &>/dev/null && docker ps &>/dev/null
+}
 
 # =============================================================================
 # ── Ayuda ──────────────────────────────────────────────────────────────────────
@@ -104,23 +109,29 @@ detect_state() {
   fi
 
   # Detectar componentes corriendo via Docker
+  DOCKER_ACCESS="missing"
   if command -v docker &>/dev/null; then
-    local projects=(
-      "lain5g-lab-app"
-      "lain5g-lab-5g-sa"
-      "lain5g-lab-4g-lte-sim"
-      "lain5g-lab-5g-vonr-sim"
-      "lain5g-lab-5g-sa-x310"
-      "lain5g-lab-5g-nsa-x310"
-    )
-    for proj in "${projects[@]}"; do
-      local count
-      count=$(docker ps --filter "label=com.docker.compose.project=$proj" \
-              --format "{{.Names}}" 2>/dev/null | wc -l)
-      if [ "$count" -gt 0 ]; then
-        RUNNING_PROJECTS+=("$proj")
-      fi
-    done
+    if docker ps &>/dev/null; then
+      DOCKER_ACCESS="ok"
+      local projects=(
+        "lain5g-lab-app"
+        "lain5g-lab-5g-sa"
+        "lain5g-lab-4g-lte-sim"
+        "lain5g-lab-5g-vonr-sim"
+        "lain5g-lab-5g-sa-x310"
+        "lain5g-lab-5g-nsa-x310"
+      )
+      for proj in "${projects[@]}"; do
+        local count
+        count=$({ docker ps --filter "label=com.docker.compose.project=$proj" \
+                --format "{{.Names}}" 2>/dev/null || true; } | wc -l)
+        if [ "$count" -gt 0 ]; then
+          RUNNING_PROJECTS+=("$proj")
+        fi
+      done
+    else
+      DOCKER_ACCESS="denied"
+    fi
   fi
 }
 
@@ -372,12 +383,12 @@ _do_uninstall() {
     echo "[!] Docker sigue instalado (el purge puede no haber completado)."
     issues=$((issues + 1))
   fi
-  if command -v docker &>/dev/null; then
+  if has_docker; then
     local rc ri rv rn
-    rc=$(docker ps -aq --filter "name=lain5g" 2>/dev/null | wc -l)
-    ri=$(docker images --format "{{.Repository}}" 2>/dev/null | { grep -c "^lain5g" || true; })
-    rv=$(docker volume ls --format "{{.Name}}" 2>/dev/null | { grep -c "^lain5g" || true; })
-    rn=$(docker network ls --format "{{.Name}}" 2>/dev/null | { grep -c "^lain5g" || true; })
+    rc=$({ docker ps -aq --filter "name=lain5g" 2>/dev/null || true; } | wc -l)
+    ri=$({ docker images --format "{{.Repository}}" 2>/dev/null || true; } | { grep -c "^lain5g" || true; })
+    rv=$({ docker volume ls --format "{{.Name}}" 2>/dev/null || true; } | { grep -c "^lain5g" || true; })
+    rn=$({ docker network ls --format "{{.Name}}" 2>/dev/null || true; } | { grep -c "^lain5g" || true; })
     [ "$rc" -gt 0 ] && { echo "[!] Quedan $rc contenedores"; issues=$((issues + 1)); }
     [ "$ri" -gt 0 ] && { echo "[!] Quedan $ri imágenes";     issues=$((issues + 1)); }
     [ "$rv" -gt 0 ] && { echo "[!] Quedan $rv volúmenes";    issues=$((issues + 1)); }
@@ -949,7 +960,7 @@ cmd_status() {
 
   echo
   echo "  Componentes corriendo:"
-  if command -v docker &>/dev/null; then
+  if [ "$DOCKER_ACCESS" = "ok" ]; then
     local known_projects=(
       "lain5g-lab-app"
       "lain5g-lab-5g-sa"
@@ -961,8 +972,8 @@ cmd_status() {
     local any_running=false
     for proj in "${known_projects[@]}"; do
       local count
-      count=$(docker ps --filter "label=com.docker.compose.project=$proj" \
-              --format "{{.Names}}" 2>/dev/null | wc -l)
+      count=$({ docker ps --filter "label=com.docker.compose.project=$proj" \
+              --format "{{.Names}}" 2>/dev/null || true; } | wc -l)
       local label
       label=$(_project_label "$proj")
       if [ "$count" -gt 0 ]; then
@@ -972,15 +983,18 @@ cmd_status() {
         printf "    ⬛ %-30s (detenido)\n" "$label"
       fi
     done
+  elif [ "$DOCKER_ACCESS" = "denied" ]; then
+    echo "    ⚠️ Docker está instalado pero tu usuario no tiene permisos sobre el socket."
+    echo "       Ejecuta: sudo usermod -aG docker \$USER && newgrp docker"
   else
-    echo "    Docker no instalado"
+    echo "    ❌ Docker no instalado"
   fi
 
-  if command -v docker &>/dev/null; then
+  if [ "$DOCKER_ACCESS" = "ok" ]; then
     echo
     echo "  Imágenes Docker lain5g:"
     local images
-    images=$(docker images --format "    {{.Repository}}:{{.Tag}}   {{.Size}}" 2>/dev/null \
+    images=$({ docker images --format "    {{.Repository}}:{{.Tag}}   {{.Size}}" 2>/dev/null || true; } \
       | grep "lain5g" || true)
     if [ -n "$images" ]; then
       echo "$images" | while IFS= read -r line; do
@@ -989,6 +1003,9 @@ cmd_status() {
     else
       echo "    ❌ Ninguna imagen lain5g encontrada"
     fi
+  elif [ "$DOCKER_ACCESS" = "denied" ]; then
+    echo
+    echo "  Imágenes Docker    : ⚠️ Sin acceso al daemon Docker"
   else
     echo
     echo "  Docker             : ❌ No instalado"
@@ -1026,7 +1043,15 @@ cmd_start() {
 
   if ! command -v docker &>/dev/null; then
     echo
-    echo "  ❌ Docker no está disponible. ¿Está instalado OpenLain5G?"
+    echo "  ❌ Docker no está instalado en el sistema."
+    pause
+    return 0
+  fi
+
+  if [ "$DOCKER_ACCESS" = "denied" ]; then
+    echo
+    echo "  ⚠️  Docker está instalado pero tu usuario no tiene permisos sobre el socket."
+    echo "     Ejecuta: sudo usermod -aG docker \$USER && newgrp docker"
     pause
     return 0
   fi
@@ -1176,7 +1201,15 @@ cmd_stop() {
 
   if ! command -v docker &>/dev/null; then
     echo
-    echo "  ❌ Docker no está disponible."
+    echo "  ❌ Docker no está instalado en el sistema."
+    pause
+    return 0
+  fi
+
+  if [ "$DOCKER_ACCESS" = "denied" ]; then
+    echo
+    echo "  ⚠️  Docker está instalado pero tu usuario no tiene permisos sobre el socket."
+    echo "     Ejecuta: sudo usermod -aG docker \$USER && newgrp docker"
     pause
     return 0
   fi
@@ -1418,6 +1451,8 @@ main_menu() {
           printf "              🟢 %s\n" "$(_project_label "$proj")"
         fi
       done
+    elif [ "$DOCKER_ACCESS" = "denied" ]; then
+      echo "   Corriendo: ⚠️  Docker sin permisos (ejecuta: sudo usermod -aG docker \$USER && newgrp docker)"
     else
       echo "   Corriendo: ⬛ Nada"
     fi
@@ -1473,7 +1508,7 @@ case "${1:-}" in
     fi
     echo
     echo "  Componentes corriendo:"
-    if command -v docker &>/dev/null; then
+    if [ "$DOCKER_ACCESS" = "ok" ]; then
       known_projects=(
         "lain5g-lab-app"
         "lain5g-lab-5g-sa"
@@ -1483,8 +1518,8 @@ case "${1:-}" in
         "lain5g-lab-5g-nsa-x310"
       )
       for proj in "${known_projects[@]}"; do
-        count=$(docker ps --filter "label=com.docker.compose.project=$proj" \
-                --format "{{.Names}}" 2>/dev/null | wc -l)
+        count=$({ docker ps --filter "label=com.docker.compose.project=$proj" \
+                --format "{{.Names}}" 2>/dev/null || true; } | wc -l)
         label=$(_project_label "$proj")
         if [ "$count" -gt 0 ]; then
           printf "    🟢 %-30s (%d contenedores)\n" "$label" "$count"
@@ -1492,18 +1527,24 @@ case "${1:-}" in
           printf "    ⬛ %-30s (detenido)\n" "$label"
         fi
       done
+    elif [ "$DOCKER_ACCESS" = "denied" ]; then
+      echo "    ⚠️ Docker instalado pero tu usuario no tiene permisos sobre el socket."
+      echo "       Ejecuta: sudo usermod -aG docker \$USER && newgrp docker"
     else
-      echo "    Docker no instalado"
+      echo "    ❌ Docker no instalado"
     fi
-    if command -v docker &>/dev/null; then
+    if [ "$DOCKER_ACCESS" = "ok" ]; then
       echo
       echo "  Imágenes Docker:"
-      images=$(docker images --format "    {{.Repository}}:{{.Tag}}   {{.Size}}" 2>/dev/null | grep "lain5g" || true)
+      images=$({ docker images --format "    {{.Repository}}:{{.Tag}}   {{.Size}}" 2>/dev/null || true; } | grep "lain5g" || true)
       if [ -n "$images" ]; then
         echo "$images" | while IFS= read -r line; do echo "    ✅$line"; done
       else
         echo "    ❌ Ninguna imagen lain5g encontrada"
       fi
+    elif [ "$DOCKER_ACCESS" = "denied" ]; then
+      echo
+      echo "  Imágenes Docker    : ⚠️ Sin acceso al daemon Docker"
     else
       echo
       echo "  Docker             : ❌ No instalado"
