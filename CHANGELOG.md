@@ -2,6 +2,15 @@
 
 All notable changes to lain5g-manager are documented here.
 
+## [1.1.8] - 2026-11-07
+
+### Added
+- Dynamic discovery of official OpenLain5G profiles (`PUBLIC_PROFILE_IDS` and `DEPLOYMENTS`)
+- Dynamic discovery of Compose project names and running containers
+- Educational section explaining the 6 containers that comprise OpenLain5G Web App & Observability
+- Integration with `./lain5g scenario start` and `./lain5g scenario stop`
+- Full compatibility with OpenLain5G v1.1.8 and backwards compatibility with earlier releases
+
 ## [1.1.7] - 2026-11-05
 
 ### Added

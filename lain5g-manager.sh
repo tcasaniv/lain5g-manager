@@ -10,8 +10,8 @@
 # =============================================================================
 set -euo pipefail
 
-MANAGER_VERSION="1.1.7"
-OPENLAIN5G_COMPAT="1.1.7"
+MANAGER_VERSION="1.1.8"
+OPENLAIN5G_COMPAT="1.1.8"
 MANAGER_REPO="https://github.com/tcasaniv/lain5g-manager"
 REPO_URL="https://github.com/guallycanazas/Lain5G"
 LAIN5G_DIR="${HOME}/Lain5G"
@@ -108,42 +108,109 @@ detect_state() {
     fi
   fi
 
-  # Detectar componentes corriendo via Docker
+  # Detectar componentes corriendo via Docker dinámicamente
   DOCKER_ACCESS="missing"
   if command -v docker &>/dev/null; then
     if docker ps &>/dev/null; then
       DOCKER_ACCESS="ok"
-      local projects=(
-        "lain5g-lab-app"
-        "lain5g-lab-5g-sa"
-        "lain5g-lab-4g-lte-sim"
-        "lain5g-lab-5g-vonr-sim"
-        "lain5g-lab-5g-sa-x310"
-        "lain5g-lab-5g-nsa-x310"
-      )
-      for proj in "${projects[@]}"; do
+      local all_projects
+      all_projects=$(_get_all_compose_projects)
+      while IFS= read -r proj; do
+        [ -z "$proj" ] && continue
         local count
         count=$({ docker ps --filter "label=com.docker.compose.project=$proj" \
                 --format "{{.Names}}" 2>/dev/null || true; } | wc -l)
         if [ "$count" -gt 0 ]; then
           RUNNING_PROJECTS+=("$proj")
         fi
-      done
+      done <<< "$all_projects"
     else
       DOCKER_ACCESS="denied"
     fi
   fi
 }
 
+# Descubrimiento dinámico de proyectos compose de OpenLain5G
+_get_all_compose_projects() {
+  if [ -d "$LAIN5G_DIR" ] && command -v python3 &>/dev/null; then
+    python3 -c "
+import os, re
+lain_dir = '${LAIN5G_DIR}'
+found = set()
+for root, dirs, files in os.walk(lain_dir):
+    for f in files:
+        if f.endswith(('.yml', '.yaml')) and ('docker-compose' in f or 'compose' in f):
+            p = os.path.join(root, f)
+            try:
+                with open(p, 'r', errors='ignore') as fp:
+                    for line in fp:
+                        m = re.match(r'^\s*name:\s*([a-zA-Z0-9_-]+)', line)
+                        if m:
+                            found.add(m.group(1))
+                            break
+            except Exception:
+                pass
+for name in sorted(found):
+    print(name)
+" 2>/dev/null && return 0
+  fi
+  # Fallback si no está Python o falla
+  cat <<'EOF'
+lain5g-lab-app
+lain5g-lab-5g-sa
+lain5g-lab-4g-lte-sim
+lain5g-lab-5g-vonr-sim
+lain5g-lab-4g-volte-sim
+lain5g-lab-5g-sa-x310
+lain5g-lab-5g-nsa-x310
+lain5g-lab-4g-lte-x310
+lain5g-lab-ims-real-4g
+lain5g-lab-ims-real-5g
+EOF
+}
+
+# Descubrimiento dinámico de perfiles oficiales
+_get_public_profiles() {
+  if [ -d "$LAIN5G_DIR" ] && command -v python3 &>/dev/null; then
+    python3 -c "
+import sys, os
+sys.path.insert(0, os.path.join('${LAIN5G_DIR}', 'src'))
+try:
+    from backend.app.services.image_catalog import PUBLIC_PROFILE_IDS
+    from backend.app.services.deployment_registry import DEPLOYMENTS
+    for pid in PUBLIC_PROFILE_IDS:
+        dep = DEPLOYMENTS.get(pid)
+        mode = getattr(dep, 'mode', 'simulation')
+        name = getattr(dep, 'name', pid)
+        desc = getattr(dep, 'description', '')
+        print(f'{pid}\t{mode}\t{name}\t{desc}')
+except Exception:
+    pass
+" 2>/dev/null && return 0
+  fi
+  # Fallback compatible
+  cat <<'EOF'
+4g-lte-sim	simulation	4G - srsRAN ZMQ Simulation	Software-only LTE con Open5GS EPC y srsRAN
+5g-sa	simulation	5G - UERANSIM Simulation	Software-only 5G SA con Open5GS y UERANSIM
+4g-lte-x310	rf-controlled	4G - Guarded LTE RF	LTE fisico con controles de seguridad RF
+5g-sa-x310	rf-controlled	5G - Guarded SA RF	5G SA fisico con controles de seguridad RF
+5g-nsa-x310	rf-controlled	5G NSA - Guarded EN-DC RF	Ancla LTE y portadora NR sobre X310
+EOF
+}
+
 # Devuelve la etiqueta legible de un compose project
 _project_label() {
   case "$1" in
-    "lain5g-lab-app")          echo "App web OpenLain5G" ;;
-    "lain5g-lab-5g-sa")        echo "Escenario 5G SA" ;;
-    "lain5g-lab-4g-lte-sim")   echo "Escenario 4G LTE Sim" ;;
-    "lain5g-lab-5g-vonr-sim")  echo "Escenario 5G VoNR Sim" ;;
+    "lain5g-lab-app")          echo "App web OpenLain5G (UI + Observabilidad)" ;;
+    "lain5g-lab-5g-sa")        echo "Escenario 5G SA (simulación)" ;;
+    "lain5g-lab-4g-lte-sim")   echo "Escenario 4G LTE (simulación)" ;;
+    "lain5g-lab-5g-vonr-sim")  echo "Escenario 5G VoNR (señalización)" ;;
+    "lain5g-lab-4g-volte-sim") echo "Escenario 4G VoLTE (señalización)" ;;
     "lain5g-lab-5g-sa-x310")   echo "Escenario 5G SA X310 (RF)" ;;
     "lain5g-lab-5g-nsa-x310")  echo "Escenario 5G NSA X310 (RF)" ;;
+    "lain5g-lab-4g-lte-x310")  echo "Escenario 4G LTE X310 (RF)" ;;
+    "lain5g-lab-ims-real-4g")  echo "Servicio IMS Real 4G" ;;
+    "lain5g-lab-ims-real-5g")  echo "Servicio IMS Real 5G" ;;
     *)                          echo "$1" ;;
   esac
 }
@@ -778,7 +845,20 @@ _about_docker() {
   ueransim-ue             Simula tu teléfono (UE)
   srsran-enb              Simula la antena 4G (eNB)
   kamailio / ims          Servidor SIP para llamadas VoLTE/VoNR
+
+  ── Suite de la App web y observabilidad (v1.1.8) ────
+  lain5g-lab-app-frontend Interfaz gráfica web React (puerto 8080)
+  lain5g-lab-app-backend  API REST FastAPI (puerto 8000)
+  lain5g-lab-app-grafana  Dashboards y métricas visuales (puerto 3000)
+  lain5g-lab-app-prometheus Base de datos de métricas (puerto 9090)
+  lain5g-lab-app-loki     Agregador de logs en tiempo real
+  lain5g-lab-app-alloy    Agente colector de logs del sistema
   ────────────────────────────────────────────────────
+
+  💡 Nota sobre los contenedores:
+  Cuando la App web está activa, verás '6 contenedores'
+  corriendo. No son perfiles de radio, sino los 6
+  servicios que componen la interfaz web y su monitoreo.
 
   No necesitas instalar ninguno de estos manualmente.
   OpenLain5G los descarga y configura automáticamente.
@@ -961,28 +1041,24 @@ cmd_status() {
   echo
   echo "  Componentes corriendo:"
   if [ "$DOCKER_ACCESS" = "ok" ]; then
-    local known_projects=(
-      "lain5g-lab-app"
-      "lain5g-lab-5g-sa"
-      "lain5g-lab-4g-lte-sim"
-      "lain5g-lab-5g-vonr-sim"
-      "lain5g-lab-5g-sa-x310"
-      "lain5g-lab-5g-nsa-x310"
-    )
     local any_running=false
-    for proj in "${known_projects[@]}"; do
+    local all_projects
+    all_projects=$(_get_all_compose_projects)
+    while IFS= read -r proj; do
+      [ -z "$proj" ] && continue
       local count
       count=$({ docker ps --filter "label=com.docker.compose.project=$proj" \
               --format "{{.Names}}" 2>/dev/null || true; } | wc -l)
       local label
       label=$(_project_label "$proj")
       if [ "$count" -gt 0 ]; then
-        printf "    🟢 %-30s (%d contenedores)\n" "$label" "$count"
+        printf "    🟢 %-45s (%d contenedores)\n" "$label" "$count"
         any_running=true
-      else
-        printf "    ⬛ %-30s (detenido)\n" "$label"
       fi
-    done
+    done <<< "$all_projects"
+    if ! $any_running; then
+      echo "    ⬛ Ningún componente corriendo actualmente (todos detenidos)"
+    fi
   elif [ "$DOCKER_ACCESS" = "denied" ]; then
     echo "    ⚠️ Docker está instalado pero tu usuario no tiene permisos sobre el socket."
     echo "       Ejecuta: sudo usermod -aG docker \$USER && newgrp docker"
@@ -1065,79 +1141,154 @@ cmd_start() {
     done
   fi
 
-  cat <<'EOF'
+  # Descubrimiento dinámico de perfiles según la versión instalada
+  local sim_ids=()
+  local sim_names=()
+  local sim_descs=()
+  local rf_ids=()
+  local rf_names=()
+  local rf_descs=()
 
-  ── Simulaciones (solo software, sin hardware) ────────
-     1) ▶️  5G SA     — 5G Stand-Alone con UERANSIM
-     2) ▶️  4G LTE    — 4G LTE con srsRAN (ZMQ)
-     3) ▶️  5G VoNR   — 5G con llamadas Voice over NR
-     4) 🌐 App web   — Interfaz web OpenLain5G
+  local profiles_raw
+  profiles_raw=$(_get_public_profiles)
+  while IFS=$'\t' read -r pid pmode pname pdesc; do
+    [ -z "$pid" ] && continue
+    if [ "$pmode" = "simulation" ]; then
+      sim_ids+=("$pid")
+      sim_names+=("$pname")
+      sim_descs+=("$pdesc")
+    else
+      rf_ids+=("$pid")
+      rf_names+=("$pname")
+      rf_descs+=("$pdesc")
+    fi
+  done <<< "$profiles_raw"
 
-  ── Con hardware RF (requiere USRP X310) ──────────────
-     5) 🔒 4G LTE X310  — Requiere hardware USRP + antenas
-     6) 🔒 5G SA  X310  — Requiere hardware USRP + antenas
-     7) 🔒 5G NSA X310  — Requiere hardware USRP + antenas
+  echo
+  echo "  ── Simulaciones (solo software, sin hardware) ────────"
+  local opt_idx=1
+  local -A opt_map_type=()
+  local -A opt_map_id=()
+  local -A opt_map_name=()
 
-     0) ↩  Cancelar
+  for i in "${!sim_ids[@]}"; do
+    printf "    %2d) ▶️  %-15s — %s\n" "$opt_idx" "${sim_ids[$i]}" "${sim_names[$i]}"
+    opt_map_type["$opt_idx"]="sim"
+    opt_map_id["$opt_idx"]="${sim_ids[$i]}"
+    opt_map_name["$opt_idx"]="${sim_names[$i]}"
+    opt_idx=$((opt_idx + 1))
+  done
 
-EOF
-  read -rp "  Elige una opción [0-7]: " sopt
+  printf "    %2d) 🌐 App web        — Interfaz web y monitoreo OpenLain5G\n" "$opt_idx"
+  opt_map_type["$opt_idx"]="app"
+  local app_idx=$opt_idx
+  opt_idx=$((opt_idx + 1))
 
-  case "$sopt" in
-    1) _start_scenario "5G SA" "lain5g-lab-5g-sa" \
-         "make -C ~/Lain5G start-5g-sa" "make -C ~/Lain5G stop-5g-sa" \
-         "start-5g-sa" ;;
-    2) _start_scenario "4G LTE Sim" "lain5g-lab-4g-lte-sim" \
-         "make -C ~/Lain5G start-4g-lte-sim" "make -C ~/Lain5G stop-4g-lte-sim" \
-         "start-4g-lte-sim" ;;
-    3) _start_scenario "5G VoNR Sim" "lain5g-lab-5g-vonr-sim" \
-         "make -C ~/Lain5G start-5g-vonr-sim" "make -C ~/Lain5G stop-5g-vonr-sim" \
-         "start-5g-vonr-sim" ;;
-    4) _start_app ;;
-    5) _show_rf_profile_panel "4G LTE X310" \
-         "LTE Band 7 — DL ~2660 MHz / UL ~2520 MHz" \
-         "make preflight-4g-lte-x310 && make start-4g-lte-x310-epc" \
-         "make stop-4g-lte-x310"
-       pause ;;
-    6) _show_rf_profile_panel "5G SA X310" \
-         "NR Band n3  — DL ~1842 MHz / UL ~1757 MHz" \
-         "make preflight-5g-x310 && make start-5g-x310-core && make start-5g-x310-rf" \
-         "make stop-5g-x310"
-       pause ;;
-    7) _show_rf_profile_panel "5G NSA X310" \
-         "NR Band n3 + LTE Band 7 — DL ~1842 MHz NR + 2660 MHz LTE" \
-         "make start-5g-x310-core" \
-         "make stop-5g-x310"
-       pause ;;
-    0) return 0 ;;
-    *) echo "  Opción inválida." ;;
+  if [ "${#rf_ids[@]}" -gt 0 ]; then
+    echo
+    echo "  ── Con hardware RF (requiere USRP X310) ──────────────"
+    echo "     ℹ️  Por seguridad no transmiten automáticamente;"
+    echo "        al seleccionar uno verás su guía de bandas, antenas y comandos."
+    for i in "${!rf_ids[@]}"; do
+      printf "    %2d) 🔒 %-15s — %s\n" "$opt_idx" "${rf_ids[$i]}" "${rf_names[$i]}"
+      opt_map_type["$opt_idx"]="rf"
+      opt_map_id["$opt_idx"]="${rf_ids[$i]}"
+      opt_map_name["$opt_idx"]="${rf_names[$i]}"
+      opt_idx=$((opt_idx + 1))
+    done
+  fi
+
+  echo
+  echo "     0) ↩  Cancelar"
+  echo
+  local max_opt=$((opt_idx - 1))
+  read -rp "  Elige una opción [0-${max_opt}]: " sopt
+
+  if [ "$sopt" = "0" ] || [ -z "$sopt" ]; then
+    return 0
+  fi
+
+  if ! [[ "$sopt" =~ ^[0-9]+$ ]] || [ "$sopt" -lt 1 ] || [ "$sopt" -gt "$max_opt" ]; then
+    echo "  Opción inválida."
+    pause
+    return 0
+  fi
+
+  local selected_type="${opt_map_type[$sopt]}"
+  local selected_id="${opt_map_id[$sopt]:-}"
+  local selected_name="${opt_map_name[$sopt]:-}"
+
+  case "$selected_type" in
+    "app")
+      _start_app
+      ;;
+    "sim")
+      _start_scenario "$selected_name" "$selected_id"
+      ;;
+    "rf")
+      case "$selected_id" in
+        "4g-lte-x310")
+          _show_rf_profile_panel "4G LTE X310" \
+            "LTE Band 7 — DL ~2660 MHz / UL ~2520 MHz" \
+            "make preflight-4g-lte-x310 && make start-4g-lte-x310-epc" \
+            "make stop-4g-lte-x310"
+          ;;
+        "5g-sa-x310")
+          _show_rf_profile_panel "5G SA X310" \
+            "NR Band n3  — DL ~1842 MHz / UL ~1757 MHz" \
+            "make preflight-5g-x310 && make start-5g-x310-core && make start-5g-x310-rf" \
+            "make stop-5g-x310"
+          ;;
+        "5g-nsa-x310")
+          _show_rf_profile_panel "5G NSA X310" \
+            "NR Band n3 + LTE Band 7 — DL ~1842 MHz NR + 2660 MHz LTE" \
+            "make start-5g-x310-core" \
+            "make stop-5g-x310"
+          ;;
+        *)
+          _show_rf_profile_panel "$selected_name ($selected_id)" \
+            "Consulta config/profiles/${selected_id}.yaml para ver radio.band y frecuencias." \
+            "./lain5g profile show $selected_id" \
+            "./lain5g scenario stop $selected_id"
+          ;;
+      esac
+      pause
+      ;;
   esac
 }
 
 _start_scenario() {
   local label="$1"
-  local compose_proj="$2"
-  local cmd_display="$3"
-  local _cmd_stop="$4"
-  local make_target="$5"
+  local profile_id="$2"
+  local compose_proj="lain5g-lab-${profile_id}"
 
   # Verificar si ya está corriendo
   local already_running=false
   for proj in "${RUNNING_PROJECTS[@]}"; do
-    [ "$proj" = "$compose_proj" ] && already_running=true
+    if [ "$proj" = "$compose_proj" ]; then
+      already_running=true
+      break
+    fi
   done
 
   if $already_running; then
     echo
-    echo "  ⚠️  '$label' ya está corriendo."
+    echo "  ⚠️  '$label' ya tiene contenedores activos."
     if ! confirm "  ¿Continuar de todas formas?"; then
       return 0
     fi
   fi
 
   echo
-  show_cmd "Iniciando escenario $label" "cd ~/Lain5G && make $make_target"
-  (cd "$LAIN5G_DIR" && make "$make_target")
+  # Si el CLI ./lain5g soporta 'scenario start', preferirlo porque prepara .env y valida imágenes
+  if [ -x "$LAIN5G_DIR/lain5g" ]; then
+    show_cmd "Iniciando escenario $label" "cd ~/Lain5G && ./lain5g scenario start $profile_id"
+    (cd "$LAIN5G_DIR" && ./lain5g scenario start "$profile_id")
+  else
+    # Fallback a Make para versiones antiguas
+    show_cmd "Iniciando escenario $label" "cd ~/Lain5G && make start-${profile_id}"
+    (cd "$LAIN5G_DIR" && make "start-${profile_id}")
+  fi
   pause
 }
 
@@ -1265,16 +1416,20 @@ cmd_stop() {
         (cd "$LAIN5G_DIR" && ./lain5g app stop) || true
         ;;
       "lain5g-lab-5g-sa")
-        show_cmd "Deteniendo $label" "cd ~/Lain5G && make stop-5g-sa"
-        (cd "$LAIN5G_DIR" && make stop-5g-sa) || true
+        show_cmd "Deteniendo $label" "cd ~/Lain5G && ./lain5g scenario stop 5g-sa"
+        (cd "$LAIN5G_DIR" && ./lain5g scenario stop 5g-sa 2>/dev/null) || (cd "$LAIN5G_DIR" && make stop-5g-sa) || true
         ;;
       "lain5g-lab-4g-lte-sim")
-        show_cmd "Deteniendo $label" "cd ~/Lain5G && make stop-4g-lte-sim"
-        (cd "$LAIN5G_DIR" && make stop-4g-lte-sim) || true
+        show_cmd "Deteniendo $label" "cd ~/Lain5G && ./lain5g scenario stop 4g-lte-sim"
+        (cd "$LAIN5G_DIR" && ./lain5g scenario stop 4g-lte-sim 2>/dev/null) || (cd "$LAIN5G_DIR" && make stop-4g-lte-sim) || true
         ;;
       "lain5g-lab-5g-vonr-sim")
-        show_cmd "Deteniendo $label" "cd ~/Lain5G && make stop-5g-vonr-sim"
-        (cd "$LAIN5G_DIR" && make stop-5g-vonr-sim) || true
+        show_cmd "Deteniendo $label" "cd ~/Lain5G && docker compose -f deployments/5g-vonr/docker-compose.yml down"
+        (cd "$LAIN5G_DIR" && docker compose -f deployments/5g-vonr/docker-compose.yml down 2>/dev/null) || true
+        ;;
+      "lain5g-lab-4g-volte-sim")
+        show_cmd "Deteniendo $label" "cd ~/Lain5G && docker compose -f deployments/4g-volte/sim/docker-compose.yml down"
+        (cd "$LAIN5G_DIR" && docker compose -f deployments/4g-volte/sim/docker-compose.yml down 2>/dev/null) || true
         ;;
       "lain5g-lab-5g-sa-x310")
         show_cmd "Deteniendo $label" "cd ~/Lain5G && make stop-5g-x310"
@@ -1284,8 +1439,21 @@ cmd_stop() {
         show_cmd "Deteniendo $label" "cd ~/Lain5G && make stop-5g-x310"
         (cd "$LAIN5G_DIR" && make stop-5g-x310) || true
         ;;
+      "lain5g-lab-4g-lte-x310")
+        show_cmd "Deteniendo $label" "cd ~/Lain5G && make stop-4g-lte-x310"
+        (cd "$LAIN5G_DIR" && make stop-4g-lte-x310) || true
+        ;;
+      "lain5g-lab-ims-real-4g")
+        show_cmd "Deteniendo $label" "cd ~/Lain5G && make ims-real-stop"
+        (cd "$LAIN5G_DIR" && make ims-real-stop 2>/dev/null) || true
+        ;;
+      "lain5g-lab-ims-real-5g")
+        show_cmd "Deteniendo $label" "cd ~/Lain5G && make ims-real-stop"
+        (cd "$LAIN5G_DIR" && make ims-real-stop 2>/dev/null) || true
+        ;;
       *)
-        echo "  ⚠️  No sé cómo detener: $proj"
+        show_cmd "Deteniendo $label ($proj)" "cd ~/Lain5G && docker compose down"
+        (cd "$LAIN5G_DIR" && docker compose down 2>/dev/null) || true
         ;;
     esac
   done
@@ -1509,24 +1677,22 @@ case "${1:-}" in
     echo
     echo "  Componentes corriendo:"
     if [ "$DOCKER_ACCESS" = "ok" ]; then
-      known_projects=(
-        "lain5g-lab-app"
-        "lain5g-lab-5g-sa"
-        "lain5g-lab-4g-lte-sim"
-        "lain5g-lab-5g-vonr-sim"
-        "lain5g-lab-5g-sa-x310"
-        "lain5g-lab-5g-nsa-x310"
-      )
-      for proj in "${known_projects[@]}"; do
+      local any_running=false
+      local all_projects
+      all_projects=$(_get_all_compose_projects)
+      while IFS= read -r proj; do
+        [ -z "$proj" ] && continue
         count=$({ docker ps --filter "label=com.docker.compose.project=$proj" \
                 --format "{{.Names}}" 2>/dev/null || true; } | wc -l)
         label=$(_project_label "$proj")
         if [ "$count" -gt 0 ]; then
-          printf "    🟢 %-30s (%d contenedores)\n" "$label" "$count"
-        else
-          printf "    ⬛ %-30s (detenido)\n" "$label"
+          printf "    🟢 %-45s (%d contenedores)\n" "$label" "$count"
+          any_running=true
         fi
-      done
+      done <<< "$all_projects"
+      if ! $any_running; then
+        echo "    ⬛ Ningún componente corriendo actualmente (todos detenidos)"
+      fi
     elif [ "$DOCKER_ACCESS" = "denied" ]; then
       echo "    ⚠️ Docker instalado pero tu usuario no tiene permisos sobre el socket."
       echo "       Ejecuta: sudo usermod -aG docker \$USER && newgrp docker"
