@@ -320,6 +320,15 @@ _do_uninstall() {
   section "PASO 1 — Bajar contenedores y eliminar volúmenes Docker"
   if [ -d "$LAIN5G_DIR" ] && command -v docker &>/dev/null; then
     cd "$LAIN5G_DIR"
+    # Bajar todos los proyectos conocidos por nombre de proyecto Compose
+    local all_known_projects
+    all_known_projects=$(_get_all_compose_projects)
+    while IFS= read -r proj; do
+      [ -z "$proj" ] && continue
+      echo "→ Bajando proyecto Docker Compose: $proj"
+      docker compose -p "$proj" down -v --remove-orphans 2>/dev/null || true
+    done <<< "$all_known_projects"
+
     declare -A _COMPOSE_ENVS=(
       ["docker-compose.app.yml"]=".env.app"
       ["deployments/5g-sa/docker-compose.yml"]="deployments/5g-sa/.env"
@@ -327,6 +336,9 @@ _do_uninstall() {
       ["deployments/5g-nsa-x310/docker-compose.yml"]="deployments/5g-nsa-x310/.env"
       ["deployments/4g-lte-sim/docker-compose.yml"]="deployments/4g-lte-sim/.env"
       ["deployments/5g-vonr/docker-compose.yml"]="deployments/5g-vonr/.env"
+      ["deployments/4g-volte/sim/docker-compose.yml"]="deployments/4g-volte/common/.env"
+      ["deployments/ims-real/compose.4g.yaml"]="deployments/ims-real/env.defaults"
+      ["deployments/ims-real/compose.5g.yaml"]="deployments/ims-real/env.defaults"
     )
     for compose_file in "${!_COMPOSE_ENVS[@]}"; do
       local env_file="${_COMPOSE_ENVS[$compose_file]}"
@@ -1184,6 +1196,10 @@ cmd_start() {
   local app_idx=$opt_idx
   opt_idx=$((opt_idx + 1))
 
+  printf "    %2d) 📞 IMS Real       — Guía e inicio de Servicio IMS Real (4G / 5G)\n" "$opt_idx"
+  opt_map_type["$opt_idx"]="ims_real"
+  opt_idx=$((opt_idx + 1))
+
   if [ "${#rf_ids[@]}" -gt 0 ]; then
     echo
     echo "  ── Con hardware RF (requiere USRP X310) ──────────────"
@@ -1221,6 +1237,9 @@ cmd_start() {
   case "$selected_type" in
     "app")
       _start_app
+      ;;
+    "ims_real")
+      _guide_ims_real
       ;;
     "sim")
       _start_scenario "$selected_name" "$selected_id"
@@ -1343,6 +1362,50 @@ EOF
   pause
 }
 
+_guide_ims_real() {
+  section "📞 Servicio IMS Real (4G / 5G)"
+  cat <<'EOF'
+
+  El servicio IMS Real de OpenLain5G es una pila aislada de Core/IMS
+  (Kamailio P/I/S-CSCF, pyHSS sobre Diameter Cx, MySQL, Open5GS)
+  diseñada para pruebas con UEs o núcleos reales sin hardware de radio RAN.
+
+  ℹ️  ¿Cómo se inicia de forma segura en OpenLain5G?
+  -------------------------------------------------------------
+  OpenLain5G delega la orquestación del IMS Real a su App Web con
+  operaciones habilitadas (`--operations`), debido a que en el arranque:
+    1. Genera y resguarda claves criptográficas en runtime (.runtime/).
+    2. Modela subredes aisladas e independientes para 4G y 5G.
+    3. Habilita el aprovisionamiento seguro de suscriptores vía pyHSS.
+
+  Puedes controlarlo e iniciarlo visualmente desde la App web en:
+    👉 http://localhost:8080/ims
+
+EOF
+
+  local app_running=false
+  for proj in "${RUNNING_PROJECTS[@]}"; do
+    [ "$proj" = "lain5g-lab-app" ] && app_running=true
+  done
+
+  if $app_running; then
+    echo "  ✅ La App web de OpenLain5G ya se encuentra activa."
+    echo "     Abre http://localhost:8080/ims en tu navegador para iniciar o gestionar IMS Real."
+  else
+    echo "  ¿Deseas iniciar la App web con modo operaciones ahora para abrir IMS Real?"
+    echo "    1) Sí, iniciar App Web en modo operaciones (abre navegador)"
+    echo "    0) Volver"
+    echo
+    read -rp "  Elige una opción [0-1]: " ims_opt
+    if [ "$ims_opt" = "1" ]; then
+      show_cmd "Iniciando App web (modo operaciones)" \
+               "cd ~/Lain5G && ./lain5g app start --operations --open"
+      (cd "$LAIN5G_DIR" && ./lain5g app start --operations --open)
+    fi
+  fi
+  pause
+}
+
 # =============================================================================
 # ── Opción 4: Detener OpenLain5G ──────────────────────────────────────────────
 # =============================================================================
@@ -1424,12 +1487,12 @@ cmd_stop() {
         (cd "$LAIN5G_DIR" && ./lain5g scenario stop 4g-lte-sim 2>/dev/null) || (cd "$LAIN5G_DIR" && make stop-4g-lte-sim) || true
         ;;
       "lain5g-lab-5g-vonr-sim")
-        show_cmd "Deteniendo $label" "cd ~/Lain5G && docker compose -f deployments/5g-vonr/docker-compose.yml down"
-        (cd "$LAIN5G_DIR" && docker compose -f deployments/5g-vonr/docker-compose.yml down 2>/dev/null) || true
+        show_cmd "Deteniendo $label" "docker compose -p lain5g-lab-5g-vonr-sim down"
+        docker compose -p lain5g-lab-5g-vonr-sim down 2>/dev/null || (cd "$LAIN5G_DIR" && docker compose -f deployments/5g-vonr/docker-compose.yml down 2>/dev/null) || true
         ;;
       "lain5g-lab-4g-volte-sim")
-        show_cmd "Deteniendo $label" "cd ~/Lain5G && docker compose -f deployments/4g-volte/sim/docker-compose.yml down"
-        (cd "$LAIN5G_DIR" && docker compose -f deployments/4g-volte/sim/docker-compose.yml down 2>/dev/null) || true
+        show_cmd "Deteniendo $label" "docker compose -p lain5g-lab-4g-volte-sim down"
+        docker compose -p lain5g-lab-4g-volte-sim down 2>/dev/null || (cd "$LAIN5G_DIR" && docker compose -f deployments/4g-volte/sim/docker-compose.yml down 2>/dev/null) || true
         ;;
       "lain5g-lab-5g-sa-x310")
         show_cmd "Deteniendo $label" "cd ~/Lain5G && make stop-5g-x310"
@@ -1444,12 +1507,12 @@ cmd_stop() {
         (cd "$LAIN5G_DIR" && make stop-4g-lte-x310) || true
         ;;
       "lain5g-lab-ims-real-4g")
-        show_cmd "Deteniendo $label" "cd ~/Lain5G && make ims-real-stop"
-        (cd "$LAIN5G_DIR" && make ims-real-stop 2>/dev/null) || true
+        show_cmd "Deteniendo $label" "docker compose -p lain5g-lab-ims-real-4g down"
+        docker compose -p lain5g-lab-ims-real-4g down 2>/dev/null || true
         ;;
       "lain5g-lab-ims-real-5g")
-        show_cmd "Deteniendo $label" "cd ~/Lain5G && make ims-real-stop"
-        (cd "$LAIN5G_DIR" && make ims-real-stop 2>/dev/null) || true
+        show_cmd "Deteniendo $label" "docker compose -p lain5g-lab-ims-real-5g down"
+        docker compose -p lain5g-lab-ims-real-5g down 2>/dev/null || true
         ;;
       *)
         show_cmd "Deteniendo $label ($proj)" "cd ~/Lain5G && docker compose down"

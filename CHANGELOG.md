@@ -2,7 +2,7 @@
 
 All notable changes to lain5g-manager are documented here.
 
-## [1.1.8] - 2026-11-07
+## [1.1.8] - 2026-11-09
 
 ### Added
 - Dynamic discovery of official OpenLain5G profiles (`PUBLIC_PROFILE_IDS` and `DEPLOYMENTS`)
@@ -10,6 +10,12 @@ All notable changes to lain5g-manager are documented here.
 - Educational section explaining the 6 containers that comprise OpenLain5G Web App & Observability
 - Integration with `./lain5g scenario start` and `./lain5g scenario stop`
 - Full compatibility with OpenLain5G v1.1.8 and backwards compatibility with earlier releases
+- Guided start for Real IMS Service (4G / 5G) via OpenLain5G Web App with operations mode
+
+### Fixed
+- Fixed stopping Real IMS 4G and 5G services (`cmd_stop`) using direct Docker Compose project-level down (`-p`) instead of blocked internal Makefile targets
+- Fixed stopping VoLTE and VoNR scenarios using Compose project-level down fallback
+- Thorough Docker Compose project cleanup during uninstall step 1 covering all discovered Compose stacks and Real IMS/VoLTE manifests
 
 ## [1.1.7] - 2026-11-05
 
