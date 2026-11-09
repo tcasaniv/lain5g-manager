@@ -548,40 +548,53 @@ _do_uninstall() {
 }
 
 _revert_x310_network_fix() {
-  if [ ! -f "$X310_FIX_STATE" ]; then
+  local FIX_TYPE="" DEV="" IP_CIDR="" WSLCONFIG_PATH="" BACKUP_PATH="" ORIGINALLY_EXISTED=""
+  if [ -f "$X310_FIX_STATE" ]; then
+    # shellcheck disable=SC1090
+    source "$X310_FIX_STATE" 2>/dev/null || true
+  fi
+
+  # Fallback de seguridad: detectar cualquier IP residual en 192.168.10.x en interfaces como eth0
+  local residual_ip=""
+  residual_ip=$(ip -4 addr show 2>/dev/null | awk '/inet 192\.168\.10\./ {print $2; exit}')
+  local residual_dev=""
+  residual_dev=$(ip -4 addr show 2>/dev/null | awk '/inet 192\.168\.10\./ {print $NF; exit}')
+  if [ -n "$residual_ip" ] && [ -z "$IP_CIDR" ]; then
+    FIX_TYPE="ip_alias"
+    DEV="${residual_dev:-eth0}"
+    IP_CIDR="$residual_ip"
+  fi
+
+  if [ -z "$FIX_TYPE" ] && [ -z "$residual_ip" ]; then
     return 0
   fi
 
-  local fix_type="" dev="" ip_cidr="" wsl_path="" bak_path="" originally_existed=""
-  # shellcheck disable=SC1090
-  source "$X310_FIX_STATE" 2>/dev/null || true
-
-  echo "→ Revirtiendo modificación previa de red X310 ($fix_type)..."
-  case "$fix_type" in
-    "ip_alias")
-      if [ -n "$dev" ] && [ -n "$ip_cidr" ]; then
-        echo "  - Retirando IP alias $ip_cidr de interfaz $dev..."
-        sudo ip addr del "$ip_cidr" dev "$dev" 2>/dev/null || true
+  echo "→ Revirtiendo modificación previa de red X310 (${FIX_TYPE:-residual})..."
+  case "$FIX_TYPE" in
+    "ip_alias"|"linux_manual")
+      if [ -n "$DEV" ] && [ -n "$IP_CIDR" ]; then
+        echo "  - Retirando IP $IP_CIDR de interfaz $DEV..."
+        sudo ip addr del "$IP_CIDR" dev "$DEV" 2>/dev/null || true
       fi
       ;;
     "wsl_mirrored")
-      if [ -n "$wsl_path" ]; then
+      if [ -n "$WSLCONFIG_PATH" ]; then
         echo "  - Restaurando configuración de .wslconfig..."
-        if [ "$originally_existed" = "true" ] && [ -f "$bak_path" ]; then
-          cp "$bak_path" "$wsl_path" 2>/dev/null || true
-          rm -f "$bak_path" 2>/dev/null || true
-        elif [ "$originally_existed" = "false" ]; then
-          rm -f "$wsl_path" 2>/dev/null || true
+        if [ "$ORIGINALLY_EXISTED" = "true" ] && [ -f "$BACKUP_PATH" ]; then
+          cp "$BACKUP_PATH" "$WSLCONFIG_PATH" 2>/dev/null || true
+          rm -f "$BACKUP_PATH" 2>/dev/null || true
+        elif [ "$ORIGINALLY_EXISTED" = "false" ]; then
+          rm -f "$WSLCONFIG_PATH" 2>/dev/null || true
         fi
       fi
       ;;
-    "linux_manual")
-      if [ -n "$dev" ] && [ -n "$ip_cidr" ]; then
-        echo "  - Retirando IP $ip_cidr de interfaz $dev..."
-        sudo ip addr del "$ip_cidr" dev "$dev" 2>/dev/null || true
-      fi
-      ;;
   esac
+
+  # Si aún quedase alguna IP residual en 192.168.10.x en Linux, limpiarla
+  if [ -n "$residual_ip" ] && [ -n "$residual_dev" ]; then
+    sudo ip addr del "$residual_ip" dev "$residual_dev" 2>/dev/null || true
+  fi
+
   rm -f "$X310_FIX_STATE" 2>/dev/null || true
   echo "✓ Modificación de red X310 revertida."
 }
@@ -647,50 +660,26 @@ cmd_fix_x310_ethernet() {
 
   if _is_wsl; then
     cat <<'EOF'
-  En WSL2, el USRP X310 suele estar conectado a una tarjeta física
-  en Windows, pero la red virtual NAT de WSL2 fuerza que el tráfico
-  pase a través del gateway virtual de Windows en lugar de ir directo.
+  En WSL2, el USRP X310 está conectado a una tarjeta física en Windows
+  (Ethernet 2). Para transmitir RF real con srsRAN/UHD se requiere
+  enlace de capa 2 (L2) directo sin pasar por el router virtual NAT.
 
-  Elige la solución que prefieras:
+  Elige la opción que prefieras:
 
-    1) ⭐ Asignar IP secundaria en caliente a eth0 (Inmediato)
-       Agrega un alias IP (192.168.10.4/24) en Linux. El kernel
-       enrutará directo sin gateway al instante.
+    1) 🔄 Configurar modo "Mirrored" en WSL2 (Recomendado para RF)
+       Escribe 'networkingMode=mirrored' en %USERPROFILE%\.wslconfig.
+       Permite que WSL2 herede directamente las tarjetas físicas de
+       Windows con rendimiento Gigabit nativo y sin gateway virtual.
        (Reversible en cualquier momento o al desinstalar).
 
-    2) 🔄 Configurar modo "Mirrored" en WSL2 (Permanente)
-       Escribe 'networkingMode=mirrored' en %USERPROFILE%\.wslconfig.
-       Permite que WSL2 comparta las tarjetas físicas de Windows.
-       (Requiere ejecutar 'wsl --shutdown' en PowerShell tras aplicar).
-
-    3) ℹ️  Ver explicación técnica y comandos manuales
+    2) ℹ️  Ver explicación técnica y estado en modo NAT
 
     0) Cancelar / Volver
 
 EOF
-    read -rp "  Elige una opción [0-3]: " wopt
+    read -rp "  Elige una opción [0-2]: " wopt
     case "$wopt" in
       1)
-        mkdir -p "$LAIN5G_STATE"
-        local dev="${route_device:-eth0}"
-        local ip_to_add="192.168.10.4/24"
-        show_cmd "Asignando alias IP para enlace directo" "sudo ip addr add $ip_to_add dev $dev"
-        if sudo ip addr add "$ip_to_add" dev "$dev" 2>/dev/null; then
-          cat <<EOF > "$X310_FIX_STATE"
-FIX_TYPE=ip_alias
-DEV=$dev
-IP_CIDR=$ip_to_add
-DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-EOF
-          echo "  ✅ Alias $ip_to_add agregado a $dev."
-          echo "     Ruta actualizada a enlace directo. El warning de ethernet_link ha sido resuelto."
-        else
-          echo "  ⚠️  No se pudo asignar el alias IP (o ya existía)."
-        fi
-        detect_state
-        pause
-        ;;
-      2)
         local win_user_prof=""
         if command -v powershell.exe &>/dev/null; then
           win_user_prof=$(powershell.exe -NoProfile -Command 'Write-Host -NoNewline $env:USERPROFILE' 2>/dev/null | tr -d '\r')
@@ -744,33 +733,30 @@ DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 EOF
         echo "  ✅ Archivo $wsl_cfg_path configurado con networkingMode=mirrored."
         echo
-        echo "  ⚠️  IMPORTANTE:"
-        echo "  Para que el cambio tome efecto en Windows:"
-        echo "  1. Guarda tu trabajo y sal del manager."
+        echo "  ⚠️  PASO OBLIGATORIO PARA APLICAR EL MODO MIRRORED:"
+        echo "  1. Guarda tu trabajo y cierra esta terminal."
         echo "  2. En PowerShell de Windows ejecuta:  wsl --shutdown"
-        echo "  3. Vuelve a abrir tu terminal Ubuntu."
+        echo "  3. Vuelve a abrir tu terminal Ubuntu en WSL2."
+        echo "     (WSL2 reflejará la interfaz física Ethernet 2 con enlace directo L2)."
         detect_state
         pause
         ;;
-      3)
+      2)
         cat <<'HELP'
-  Explicación técnica:
-  -------------------------------------------------------------
-  El chequeo de hardware de OpenLain5G verifica:
-    - Que el tráfico a 192.168.10.2 sea 'direct route' (sin 'via gateway').
-    - Que la interfaz no sea wireless.
-    - Que tenga carrier activo.
+  Explicación técnica del enlace X310 en WSL2:
+  ─────────────────────────────────────────────────────────────
+  1. En modo NAT por defecto:
+     - El tráfico hacia 192.168.10.2 viaja a través del gateway
+       virtual de Windows (172.20.192.1).
+     - El ping funciona, pero srsRAN/UHD para transmisión RF real
+       puede sufrir caídas de paquetes o jitter al cruzar la capa
+       NAT de Hyper-V.
+     - OpenLain5G advierte (WARNING) para proteger de pérdidas I/Q.
 
-  En WSL2 por defecto, Windows actúa como un enrutador virtual (gateway),
-  lo que añade capas de virtualización al tráfico de muestras I/Q de RF.
-
-  Comandos manuales útiles:
-    • Asignar IP temporal en WSL:
-      sudo ip addr add 192.168.10.4/24 dev eth0
-    • Quitar IP temporal:
-      sudo ip addr del 192.168.10.4/24 dev eth0
-    • Comprobar ruta:
-      ip -4 route get 192.168.10.2
+  2. En modo Mirrored (networkingMode=mirrored):
+     - Windows 11 comparte directamente sus adaptadores de red con Linux.
+     - Linux accede directamente a la interfaz física Ethernet 2.
+     - El chequeo ethernet_link pasa a PASS con rendimiento nativo.
 
 HELP
         pause
