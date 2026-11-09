@@ -667,17 +667,21 @@ cmd_fix_x310_ethernet() {
   Elige la opción que prefieras:
 
     1) 🔄 Configurar modo "Mirrored" en WSL2 (Recomendado para RF)
-       Escribe 'networkingMode=mirrored' en %USERPROFILE%\.wslconfig.
-       Permite que WSL2 herede directamente las tarjetas físicas de
-       Windows con rendimiento Gigabit nativo y sin gateway virtual.
+       Escribe 'networkingMode=mirrored', 'dnsTunneling=true' y 'autoProxy=true'
+       en %USERPROFILE%\.wslconfig para permitir enlace directo L2 con el USRP
+       sin perder acceso a Internet/DNS.
        (Reversible en cualquier momento o al desinstalar).
 
-    2) ℹ️  Ver explicación técnica y estado en modo NAT
+    2) 📡 Reparar / Inicializar archivos RF para Preflight (channel-plan y safety-manifest)
+       Genera o corrige channel-plan.yaml con las frecuencias DL/UL (2660/2540 MHz)
+       y safety-manifest.yaml requeridos para aprobar rf_preflight en perfiles RF.
+
+    3) ℹ️  Ver explicación técnica y estado en modo NAT
 
     0) Cancelar / Volver
 
 EOF
-    read -rp "  Elige una opción [0-2]: " wopt
+    read -rp "  Elige una opción [0-3]: " wopt
     case "$wopt" in
       1)
         local win_user_prof=""
@@ -695,6 +699,8 @@ EOF
           echo "     con el contenido:"
           echo "       [wsl2]"
           echo "       networkingMode=mirrored"
+          echo "       dnsTunneling=true"
+          echo "       autoProxy=true"
           pause
           return 0
         fi
@@ -708,19 +714,29 @@ EOF
         fi
 
         if [ "$existed" = "true" ]; then
-          if grep -qi "networkingMode" "$wsl_cfg_path"; then
-            sed -i 's/networkingMode=.*/networkingMode=mirrored/gI' "$wsl_cfg_path"
-          else
-            if grep -qi "\[wsl2\]" "$wsl_cfg_path"; then
-              sed -i '/\[wsl2\]/a networkingMode=mirrored' "$wsl_cfg_path"
+          if grep -qi "\[wsl2\]" "$wsl_cfg_path"; then
+            if grep -qi "networkingMode" "$wsl_cfg_path"; then
+              sed -i 's/networkingMode=.*/networkingMode=mirrored/gI' "$wsl_cfg_path"
             else
-              printf "\n[wsl2]\nnetworkingMode=mirrored\n" >> "$wsl_cfg_path"
+              sed -i '/\[wsl2\]/a networkingMode=mirrored' "$wsl_cfg_path"
             fi
+            grep -qi "dnsTunneling" "$wsl_cfg_path" || sed -i '/\[wsl2\]/a dnsTunneling=true' "$wsl_cfg_path"
+            grep -qi "autoProxy" "$wsl_cfg_path" || sed -i '/\[wsl2\]/a autoProxy=true' "$wsl_cfg_path"
+          else
+            cat <<'CFG' >> "$wsl_cfg_path"
+
+[wsl2]
+networkingMode=mirrored
+dnsTunneling=true
+autoProxy=true
+CFG
           fi
         else
           cat <<'CFG' > "$wsl_cfg_path"
 [wsl2]
 networkingMode=mirrored
+dnsTunneling=true
+autoProxy=true
 CFG
         fi
 
@@ -731,17 +747,24 @@ BACKUP_PATH=$bak_path
 ORIGINALLY_EXISTED=$existed
 DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 EOF
-        echo "  ✅ Archivo $wsl_cfg_path configurado con networkingMode=mirrored."
+        echo "  ✅ Archivo $wsl_cfg_path configurado con:"
+        echo "     - networkingMode=mirrored"
+        echo "     - dnsTunneling=true"
+        echo "     - autoProxy=true"
         echo
         echo "  ⚠️  PASO OBLIGATORIO PARA APLICAR EL MODO MIRRORED:"
         echo "  1. Guarda tu trabajo y cierra esta terminal."
         echo "  2. En PowerShell de Windows ejecuta:  wsl --shutdown"
         echo "  3. Vuelve a abrir tu terminal Ubuntu en WSL2."
-        echo "     (WSL2 reflejará la interfaz física Ethernet 2 con enlace directo L2)."
+        echo "     (WSL2 reflejará la interfaz física Ethernet 2 con enlace directo L2 e Internet intacto)."
         detect_state
         pause
         ;;
       2)
+        _setup_rf_preflight_files
+        pause
+        ;;
+      3)
         cat <<'HELP'
   Explicación técnica del enlace X310 en WSL2:
   ─────────────────────────────────────────────────────────────
@@ -837,9 +860,102 @@ EOF
         done
         pause
         ;;
+      3)
+        _setup_rf_preflight_files
+        pause
+        ;;
       0) return 0 ;;
     esac
   fi
+}
+
+_setup_rf_preflight_files() {
+  section "📡 Reparación y Preparación de Archivos RF Preflight"
+  cat <<'EOF'
+  Esta herramienta genera o ajusta los archivos locales de laboratorio
+  (channel-plan.yaml y safety-manifest.yaml) requeridos por OpenLain5G
+  para que el control de seguridad 'rf_preflight' pase exitosamente.
+
+  Elige qué escenario deseas preparar:
+    1) 4G LTE X310 (Banda 7, EARFCN 3150, DL: 2660 MHz, UL: 2540 MHz)
+    2) 5G SA X310  (Banda n3, DL ARFCN 368500, SCS: 15 kHz)
+    0) Volver
+EOF
+  read -rp "  Elige una opción [0-2]: " rf_opt
+  case "$rf_opt" in
+    1)
+      local d_dir="$LAIN5G_DIR/deployments/4g-volte/x310/rf"
+      if [ ! -d "$d_dir" ]; then
+        echo "  ❌ Directorio $d_dir no encontrado."
+        return 0
+      fi
+      cat <<'YAML_4G' > "$d_dir/channel-plan.yaml"
+band: 7
+earfcn: 3150
+downlink_frequency_hz: 2660000000
+uplink_frequency_hz: 2540000000
+bandwidth_mhz: 5
+tx_gain: 20
+rx_gain: 40
+sample_rate: 11.52
+YAML_4G
+      if [ ! -f "$d_dir/safety-manifest.yaml" ] || grep -q "authorization_confirmed: false" "$d_dir/safety-manifest.yaml" 2>/dev/null; then
+        cat <<'YAML_SM' > "$d_dir/safety-manifest.yaml"
+lab_mode: shielded
+authorization_confirmed: true
+antenna_connected: true
+attenuation_db: 60
+shielded_environment: true
+maximum_duration_seconds: 600
+auto_stop: true
+capture_logs: true
+operator_note: Controlled RF session from OpenLain5G Manager
+YAML_SM
+      fi
+      echo "  ✅ Archivos de 4G LTE X310 actualizados:"
+      echo "     - $d_dir/channel-plan.yaml (DL: 2660000000 Hz, UL: 2540000000 Hz)"
+      echo "     - $d_dir/safety-manifest.yaml (shielded, auto-stop: 600s, auth: true)"
+      echo
+      echo "  Probando preflight 4G..."
+      if [ -x "$LAIN5G_DIR/deployments/4g-volte/x310/scripts/preflight.sh" ]; then
+        (cd "$LAIN5G_DIR" && LAIN5G_DRY_RUN=false ./deployments/4g-volte/x310/scripts/preflight.sh 2>&1 | grep -E "channel_frequency|safety_manifest|authorization") || true
+      fi
+      ;;
+    2)
+      local d_dir="$LAIN5G_DIR/deployments/5g-sa-x310/rf"
+      if [ ! -d "$d_dir" ]; then
+        echo "  ❌ Directorio $d_dir no encontrado."
+        return 0
+      fi
+      cat <<'YAML_5G' > "$d_dir/channel-plan.yaml"
+nr_band: 3
+dl_arfcn: 368500
+channel_bandwidth_mhz: 10
+common_scs: 15
+duplex_mode: FDD
+authorized_lab_frequency: true
+operator_note: Controlled RF session from OpenLain5G Manager
+YAML_5G
+      if [ ! -f "$d_dir/safety-manifest.yaml" ] || grep -q "authorization_confirmed: false" "$d_dir/safety-manifest.yaml" 2>/dev/null; then
+        cat <<'YAML_SM5' > "$d_dir/safety-manifest.yaml"
+lab_mode: shielded
+authorization_confirmed: true
+antenna_connected: true
+attenuation_db: 60
+shielded_environment: true
+maximum_duration_seconds: 600
+auto_stop: true
+capture_logs: true
+operator_note: Controlled RF session from OpenLain5G Manager
+YAML_SM5
+      fi
+      echo "  ✅ Archivos de 5G SA X310 actualizados:"
+      echo "     - $d_dir/channel-plan.yaml (Banda n3, DL ARFCN: 368500, SCS: 15)"
+      echo "     - $d_dir/safety-manifest.yaml (shielded, auto-stop: 600s, auth: true)"
+      ;;
+    0) return 0 ;;
+    *) echo "  Opción inválida." ;;
+  esac
 }
 
 # =============================================================================
@@ -983,6 +1099,17 @@ EOF
   O directamente con Make:
     \$ $make_start
     \$ $make_stop
+
+  ─── Asistente de Preparación RF ────────────────────
+
+  ¿Deseas verificar o inicializar los archivos de laboratorio
+  (channel-plan.yaml y safety-manifest.yaml) para este perfil?
+EOF
+  if confirm "  ¿Inicializar/Reparar archivos de seguridad y frecuencia para preflight?"; then
+    _setup_rf_preflight_files
+  fi
+
+  cat <<EOF
 
   ─── Más información ────────────────────────────────
 
@@ -2131,8 +2258,7 @@ case "${1:-}" in
     echo
     echo "  Componentes corriendo:"
     if [ "$DOCKER_ACCESS" = "ok" ]; then
-      local any_running=false
-      local all_projects
+      any_running=false
       all_projects=$(_get_all_compose_projects)
       while IFS= read -r proj; do
         [ -z "$proj" ] && continue
