@@ -16,12 +16,71 @@ MANAGER_REPO="https://github.com/tcasaniv/lain5g-manager"
 REPO_URL="https://github.com/guallycanazas/Lain5G"
 LAIN5G_DIR="${HOME}/Lain5G"
 LAIN5G_STATE="${HOME}/.local/state/lain5g"
+X310_FIX_STATE="${LAIN5G_STATE}/x310_network_fix.env"
+X310_ETH_ISSUE=false
+X310_ETH_REASON=""
 SELECTED_REF=""
 INSTALLED=false
 VERSION_STR="no instalado"
 GIT_REF="—"
 RUNNING_PROJECTS=()
 DOCKER_ACCESS="missing"
+
+_is_wsl() {
+  grep -qi "microsoft" /proc/version 2>/dev/null || [[ -n "${WSL_DISTRO_NAME:-}" ]]
+}
+
+_detect_x310_ethernet_issue() {
+  X310_ETH_ISSUE=false
+  X310_ETH_REASON=""
+
+  # Si ya hay un fix activo registrado, marcamos para permitir su gestión o reversión
+  if [ -f "$X310_FIX_STATE" ]; then
+    X310_ETH_ISSUE=true
+    local fix_t=""
+    fix_t=$(grep -E "^FIX_TYPE=" "$X310_FIX_STATE" 2>/dev/null | cut -d= -f2 || true)
+    X310_ETH_REASON="Modificación activa registrada ($fix_t)"
+    return 0
+  fi
+
+  local target_addr="${USRP_ADDR:-192.168.10.2}"
+  local route
+  route="$(ip -4 route get "$target_addr" 2>/dev/null | head -n1 || true)"
+  if [ -z "$route" ]; then
+    X310_ETH_ISSUE=true
+    X310_ETH_REASON="Sin ruta IPv4 hacia USRP X310 ($target_addr)"
+    return 0
+  fi
+
+  local route_gateway
+  route_gateway="$(awk '{for (i=1; i<=NF; i++) if ($i == "via") {print $(i+1); exit}}' <<< "$route")"
+  local route_device
+  route_device="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' <<< "$route")"
+
+  if [ -n "$route_gateway" ]; then
+    X310_ETH_ISSUE=true
+    if _is_wsl; then
+      X310_ETH_REASON="Ruta a $target_addr usa gateway virtual WSL2 ($route_gateway via $route_device)"
+    else
+      X310_ETH_REASON="Ruta a $target_addr usa gateway ($route_gateway via $route_device) en lugar de enlace L2 directo"
+    fi
+    return 0
+  fi
+
+  local sys_class_net="${LAIN5G_SYS_CLASS_NET:-/sys/class/net}"
+  local iface_path="$sys_class_net/${route_device:-missing}"
+  if [ -d "$iface_path/wireless" ]; then
+    X310_ETH_ISSUE=true
+    X310_ETH_REASON="Ruta hacia $target_addr usa interfaz inalámbrica ($route_device)"
+    return 0
+  fi
+
+  if [ -r "$iface_path/carrier" ] && [ "$(cat "$iface_path/carrier" 2>/dev/null || true)" = "0" ]; then
+    X310_ETH_ISSUE=true
+    X310_ETH_REASON="Interfaz $route_device no tiene enlace físico activo (cable desconectado)"
+    return 0
+  fi
+}
 
 has_docker() {
   command -v docker &>/dev/null && docker ps &>/dev/null
@@ -128,6 +187,9 @@ detect_state() {
       DOCKER_ACCESS="denied"
     fi
   fi
+
+  # Detectar problemas de enlace de red con USRP X310
+  _detect_x310_ethernet_issue
 }
 
 # Descubrimiento dinámico de proyectos compose de OpenLain5G
@@ -438,6 +500,9 @@ _do_uninstall() {
     echo "→ Se conserva Docker y paquetes del sistema."
   fi
 
+  section "PASO 6b — Revertir modificaciones de red y enrutamiento X310"
+  _revert_x310_network_fix
+
   section "PASO 7 — Eliminar directorio del proyecto"
   if [ -d "$LAIN5G_DIR" ]; then
     echo "→ Eliminando: $LAIN5G_DIR"
@@ -479,6 +544,315 @@ _do_uninstall() {
     echo; echo "✅ Desinstalación completa. Sistema limpio."
   else
     echo; echo "⚠️  $issues elemento(s) no se pudieron eliminar."
+  fi
+}
+
+_revert_x310_network_fix() {
+  if [ ! -f "$X310_FIX_STATE" ]; then
+    return 0
+  fi
+
+  local fix_type="" dev="" ip_cidr="" wsl_path="" bak_path="" originally_existed=""
+  # shellcheck disable=SC1090
+  source "$X310_FIX_STATE" 2>/dev/null || true
+
+  echo "→ Revirtiendo modificación previa de red X310 ($fix_type)..."
+  case "$fix_type" in
+    "ip_alias")
+      if [ -n "$dev" ] && [ -n "$ip_cidr" ]; then
+        echo "  - Retirando IP alias $ip_cidr de interfaz $dev..."
+        sudo ip addr del "$ip_cidr" dev "$dev" 2>/dev/null || true
+      fi
+      ;;
+    "wsl_mirrored")
+      if [ -n "$wsl_path" ]; then
+        echo "  - Restaurando configuración de .wslconfig..."
+        if [ "$originally_existed" = "true" ] && [ -f "$bak_path" ]; then
+          cp "$bak_path" "$wsl_path" 2>/dev/null || true
+          rm -f "$bak_path" 2>/dev/null || true
+        elif [ "$originally_existed" = "false" ]; then
+          rm -f "$wsl_path" 2>/dev/null || true
+        fi
+      fi
+      ;;
+    "linux_manual")
+      if [ -n "$dev" ] && [ -n "$ip_cidr" ]; then
+        echo "  - Retirando IP $ip_cidr de interfaz $dev..."
+        sudo ip addr del "$ip_cidr" dev "$dev" 2>/dev/null || true
+      fi
+      ;;
+  esac
+  rm -f "$X310_FIX_STATE" 2>/dev/null || true
+  echo "✓ Modificación de red X310 revertida."
+}
+
+# =============================================================================
+# ── Asistente de Reparación / Reversión Ethernet X310 ────────────────────────
+# =============================================================================
+cmd_fix_x310_ethernet() {
+  section "🔧 Asistente de Enlace Ethernet USRP X310"
+  local target_addr="${USRP_ADDR:-192.168.10.2}"
+
+  echo "  Diagnóstico del enlace:"
+  echo "  ──────────────────────────────────────────────────────"
+  echo "  Destino USRP        : $target_addr"
+  if _is_wsl; then
+    echo "  Entorno detectado   : WSL2 (Windows Subsystem for Linux)"
+  else
+    echo "  Entorno detectado   : Linux Nativo"
+  fi
+
+  local route
+  route="$(ip -4 route get "$target_addr" 2>/dev/null | head -n1 || true)"
+  local route_device
+  route_device="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' <<< "$route")"
+  local route_gateway
+  route_gateway="$(awk '{for (i=1; i<=NF; i++) if ($i == "via") {print $(i+1); exit}}' <<< "$route")"
+
+  if [ -n "$route_gateway" ]; then
+    echo "  Ruta actual         : $target_addr vía gateway $route_gateway (interfaz $route_device)"
+    echo "  Estado de enlace    : ⚠️  Ruta no directa (enrutada vía gateway)"
+  elif [ -n "$route_device" ]; then
+    echo "  Ruta actual         : $target_addr directo por interfaz $route_device (scope link)"
+    echo "  Estado de enlace    : ✅ Enlace directo L2 detectado"
+  else
+    echo "  Estado de enlace    : ❌ No se encontró ruta hacia $target_addr"
+  fi
+
+  if [ -f "$X310_FIX_STATE" ]; then
+    echo "  Estado de gestor    : ⚠️  Modificación aplicada previamente"
+  fi
+  echo "  ──────────────────────────────────────────────────────"
+  echo
+
+  if [ -f "$X310_FIX_STATE" ]; then
+    echo "  Hay una configuración aplicada por lain5g-manager activa."
+    echo
+    echo "  [1] Revertir modificación y restaurar configuración original"
+    echo "  [0] Volver"
+    echo
+    read -rp "  Elige una opción [0-1]: " opt_fix
+    case "$opt_fix" in
+      1)
+        _revert_x310_network_fix
+        detect_state
+        pause
+        return 0
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+  fi
+
+  if _is_wsl; then
+    cat <<'EOF'
+  En WSL2, el USRP X310 suele estar conectado a una tarjeta física
+  en Windows, pero la red virtual NAT de WSL2 fuerza que el tráfico
+  pase a través del gateway virtual de Windows en lugar de ir directo.
+
+  Elige la solución que prefieras:
+
+    1) ⭐ Asignar IP secundaria en caliente a eth0 (Inmediato)
+       Agrega un alias IP (192.168.10.4/24) en Linux. El kernel
+       enrutará directo sin gateway al instante.
+       (Reversible en cualquier momento o al desinstalar).
+
+    2) 🔄 Configurar modo "Mirrored" en WSL2 (Permanente)
+       Escribe 'networkingMode=mirrored' en %USERPROFILE%\.wslconfig.
+       Permite que WSL2 comparta las tarjetas físicas de Windows.
+       (Requiere ejecutar 'wsl --shutdown' en PowerShell tras aplicar).
+
+    3) ℹ️  Ver explicación técnica y comandos manuales
+
+    0) Cancelar / Volver
+
+EOF
+    read -rp "  Elige una opción [0-3]: " wopt
+    case "$wopt" in
+      1)
+        mkdir -p "$LAIN5G_STATE"
+        local dev="${route_device:-eth0}"
+        local ip_to_add="192.168.10.4/24"
+        show_cmd "Asignando alias IP para enlace directo" "sudo ip addr add $ip_to_add dev $dev"
+        if sudo ip addr add "$ip_to_add" dev "$dev" 2>/dev/null; then
+          cat <<EOF > "$X310_FIX_STATE"
+FIX_TYPE=ip_alias
+DEV=$dev
+IP_CIDR=$ip_to_add
+DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+EOF
+          echo "  ✅ Alias $ip_to_add agregado a $dev."
+          echo "     Ruta actualizada a enlace directo. El warning de ethernet_link ha sido resuelto."
+        else
+          echo "  ⚠️  No se pudo asignar el alias IP (o ya existía)."
+        fi
+        detect_state
+        pause
+        ;;
+      2)
+        local win_user_prof=""
+        if command -v powershell.exe &>/dev/null; then
+          win_user_prof=$(powershell.exe -NoProfile -Command 'Write-Host -NoNewline $env:USERPROFILE' 2>/dev/null | tr -d '\r')
+        fi
+        local wsl_cfg_path=""
+        if [ -n "$win_user_prof" ] && command -v wslpath &>/dev/null; then
+          wsl_cfg_path="$(wslpath "$win_user_prof")/.wslconfig"
+        fi
+
+        if [ -z "$wsl_cfg_path" ]; then
+          echo "  ❌ No se pudo localizar la carpeta de usuario de Windows desde WSL."
+          echo "     Por favor crea manualmente el archivo C:\\Users\\<TuUsuario>\\.wslconfig"
+          echo "     con el contenido:"
+          echo "       [wsl2]"
+          echo "       networkingMode=mirrored"
+          pause
+          return 0
+        fi
+
+        mkdir -p "$LAIN5G_STATE"
+        local existed=false
+        local bak_path="${wsl_cfg_path}.lain5g.bak"
+        if [ -f "$wsl_cfg_path" ]; then
+          existed=true
+          cp "$wsl_cfg_path" "$bak_path"
+        fi
+
+        if [ "$existed" = "true" ]; then
+          if grep -qi "networkingMode" "$wsl_cfg_path"; then
+            sed -i 's/networkingMode=.*/networkingMode=mirrored/gI' "$wsl_cfg_path"
+          else
+            if grep -qi "\[wsl2\]" "$wsl_cfg_path"; then
+              sed -i '/\[wsl2\]/a networkingMode=mirrored' "$wsl_cfg_path"
+            else
+              printf "\n[wsl2]\nnetworkingMode=mirrored\n" >> "$wsl_cfg_path"
+            fi
+          fi
+        else
+          cat <<'CFG' > "$wsl_cfg_path"
+[wsl2]
+networkingMode=mirrored
+CFG
+        fi
+
+        cat <<EOF > "$X310_FIX_STATE"
+FIX_TYPE=wsl_mirrored
+WSLCONFIG_PATH=$wsl_cfg_path
+BACKUP_PATH=$bak_path
+ORIGINALLY_EXISTED=$existed
+DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+EOF
+        echo "  ✅ Archivo $wsl_cfg_path configurado con networkingMode=mirrored."
+        echo
+        echo "  ⚠️  IMPORTANTE:"
+        echo "  Para que el cambio tome efecto en Windows:"
+        echo "  1. Guarda tu trabajo y sal del manager."
+        echo "  2. En PowerShell de Windows ejecuta:  wsl --shutdown"
+        echo "  3. Vuelve a abrir tu terminal Ubuntu."
+        detect_state
+        pause
+        ;;
+      3)
+        cat <<'HELP'
+  Explicación técnica:
+  -------------------------------------------------------------
+  El chequeo de hardware de OpenLain5G verifica:
+    - Que el tráfico a 192.168.10.2 sea 'direct route' (sin 'via gateway').
+    - Que la interfaz no sea wireless.
+    - Que tenga carrier activo.
+
+  En WSL2 por defecto, Windows actúa como un enrutador virtual (gateway),
+  lo que añade capas de virtualización al tráfico de muestras I/Q de RF.
+
+  Comandos manuales útiles:
+    • Asignar IP temporal en WSL:
+      sudo ip addr add 192.168.10.4/24 dev eth0
+    • Quitar IP temporal:
+      sudo ip addr del 192.168.10.4/24 dev eth0
+    • Comprobar ruta:
+      ip -4 route get 192.168.10.2
+
+HELP
+        pause
+        ;;
+      0)
+        return 0
+        ;;
+      *)
+        echo "Opción inválida."
+        pause
+        ;;
+    esac
+  else
+    # Linux Nativo
+    cat <<'EOF'
+  En Linux nativo, el USRP X310 debe conectarse directamente a una
+  tarjeta de red cableada del equipo con una IP estática en la misma
+  subred (ejemplo: 192.168.10.1/24 o 192.168.10.3/24).
+
+  Elige una opción:
+
+    1) Asignar IP fija a una interfaz física detectada
+    2) Diagnóstico de cables y estado de enlace (carrier)
+    0) Volver
+
+EOF
+    read -rp "  Elige una opción [0-2]: " lopt
+    case "$lopt" in
+      1)
+        echo
+        echo "  Interfaces de red disponibles:"
+        local -a ifaces=()
+        local idx=1
+        for i in $(ip -o link show | awk -F': ' '{print $2}' | grep -vE "^lo$|^docker|^br-|^veth"); do
+          echo "    $idx) $i"
+          ifaces+=("$i")
+          idx=$((idx + 1))
+        done
+        if [ "${#ifaces[@]}" -eq 0 ]; then
+          echo "    (No se detectaron interfaces físicas)"
+          pause
+          return 0
+        fi
+        read -rp "  Selecciona interfaz [1-${#ifaces[@]}]: " if_choice
+        if [[ "$if_choice" =~ ^[0-9]+$ ]] && [ "$if_choice" -ge 1 ] && [ "$if_choice" -le "${#ifaces[@]}" ]; then
+          local sel_if="${ifaces[$((if_choice - 1))]}"
+          local ip_to_add="192.168.10.3/24"
+          read -rp "  IP con prefijo CIDR a asignar [Enter = $ip_to_add]: " user_ip
+          user_ip="${user_ip:-$ip_to_add}"
+          show_cmd "Asignando IP" "sudo ip addr add $user_ip dev $sel_if"
+          if sudo ip addr add "$user_ip" dev "$sel_if" 2>/dev/null; then
+            mkdir -p "$LAIN5G_STATE"
+            cat <<EOF > "$X310_FIX_STATE"
+FIX_TYPE=linux_manual
+DEV=$sel_if
+IP_CIDR=$user_ip
+DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+EOF
+            echo "  ✅ IP asignada correctamente a $sel_if."
+          else
+            echo "  ⚠️  No se pudo asignar la IP (o ya existía)."
+          fi
+        fi
+        detect_state
+        pause
+        ;;
+      2)
+        echo
+        echo "  Estado de enlace en interfaces físicas:"
+        for i in $(ip -o link show | awk -F': ' '{print $2}' | grep -vE "^lo$|^docker|^br-|^veth"); do
+          local c="desconocido"
+          [ -r "/sys/class/net/$i/carrier" ] && c=$(cat "/sys/class/net/$i/carrier" 2>/dev/null || echo "0")
+          if [ "$c" = "1" ]; then
+            printf "    ✅ %-15s : Cable conectado (Carrier UP)\n" "$i"
+          else
+            printf "    ❌ %-15s : Sin enlace (Cable desconectado o USRP apagado)\n" "$i"
+          fi
+        done
+        pause
+        ;;
+      0) return 0 ;;
+    esac
   fi
 }
 
@@ -630,6 +1004,17 @@ EOF
   → $REPO_URL/blob/main/docs/
 
 EOF
+
+  if $X310_ETH_ISSUE; then
+    echo "  ──────────────────────────────────────────────────────"
+    echo "  ⚠️  ATENCIÓN: Problema detectado en enlace Ethernet X310:"
+    echo "      $X310_ETH_REASON"
+    echo "      Se recomienda ejecutar el Asistente de Enlace Ethernet X310."
+    echo "  ──────────────────────────────────────────────────────"
+    if confirm "  ¿Deseas abrir el Asistente de Reparación Ethernet X310 ahora?"; then
+      cmd_fix_x310_ethernet
+    fi
+  fi
 }
 
 # =============================================================================
@@ -1688,6 +2073,12 @@ main_menu() {
       echo "   Corriendo: ⬛ Nada"
     fi
 
+    # Alerta y opción condicional para Enlace Ethernet USRP X310
+    if $X310_ETH_ISSUE; then
+      echo
+      echo "   ⚠️  Enlace X310: $X310_ETH_REASON"
+    fi
+
     echo
     echo "   1) ℹ️  Acerca de OpenLain5G"
     echo "   2) 📊 Ver estado detallado"
@@ -1696,11 +2087,18 @@ main_menu() {
     echo "   5) 📦 Instalar"
     echo "   6) 🗑️  Desinstalar"
     echo "   7) 🔄 Reinstalar"
+    if $X310_ETH_ISSUE; then
+      echo "   R) 🔧 Asistente: Reparar / Revertir enlace Ethernet X310"
+    fi
     echo "   8) ❌ Salir"
     echo
-    read -rp "Elige una opción [1-8]: " opt
+    if $X310_ETH_ISSUE; then
+      read -rp "Elige una opción [1-8 o R]: " opt
+    else
+      read -rp "Elige una opción [1-8]: " opt
+    fi
 
-    case "$opt" in
+    case "${opt,,}" in
       1) cmd_about     ;;
       2) cmd_status    ;;
       3) cmd_start     ;;
@@ -1708,8 +2106,15 @@ main_menu() {
       5) cmd_install   ;;
       6) cmd_uninstall ;;
       7) cmd_reinstall ;;
+      r)
+        if $X310_ETH_ISSUE; then
+          cmd_fix_x310_ethernet
+        else
+          echo "  Opción no aplicable actualmente."
+        fi
+        ;;
       8) echo; echo "Hasta luego."; exit 0 ;;
-      *) echo "  Opción inválida. Elige entre 1 y 8." ;;
+      *) echo "  Opción inválida." ;;
     esac
   done
 }

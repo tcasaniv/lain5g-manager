@@ -11,6 +11,7 @@ All notable changes to lain5g-manager are documented here.
 - Integration with `./lain5g scenario start` and `./lain5g scenario stop`
 - Full compatibility with OpenLain5G v1.1.8 and backwards compatibility with earlier releases
 - Guided start for Real IMS Service (4G / 5G) via OpenLain5G Web App with operations mode
+- Smart conditional USRP X310 Ethernet assistant detecting environment (Linux vs WSL2) with full reversibility and automatic cleanup on uninstall
 
 ### Fixed
 - Fixed stopping Real IMS 4G and 5G services (`cmd_stop`) using direct Docker Compose project-level down (`-p`) instead of blocked internal Makefile targets
