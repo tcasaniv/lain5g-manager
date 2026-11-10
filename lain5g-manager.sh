@@ -571,7 +571,7 @@ _revert_x310_network_fix() {
 
   echo "→ Revirtiendo modificación previa de red X310 (${FIX_TYPE:-residual})..."
   case "$FIX_TYPE" in
-    "ip_alias"|"linux_manual")
+    "ip_alias"|"linux_manual"|"direct_link")
       if [ -n "$DEV" ] && [ -n "$IP_CIDR" ]; then
         echo "  - Retirando IP $IP_CIDR de interfaz $DEV..."
         sudo ip addr del "$IP_CIDR" dev "$DEV" 2>/dev/null || true
@@ -660,30 +660,93 @@ cmd_fix_x310_ethernet() {
 
   if _is_wsl; then
     cat <<'EOF'
-  En WSL2, el USRP X310 está conectado a una tarjeta física en Windows
-  (Ethernet 2). Para transmitir RF real con srsRAN/UHD se requiere
-  enlace de capa 2 (L2) directo sin pasar por el router virtual NAT.
+  En WSL2, la conexión con el USRP X310 se realiza a través de las
+  tarjetas de red del host.
 
   Elige la opción que prefieras:
 
-    1) 🔄 Configurar modo "Mirrored" en WSL2 (Recomendado para RF)
-       Escribe 'networkingMode=mirrored', 'dnsTunneling=true' y 'autoProxy=true'
-       en %USERPROFILE%\.wslconfig para permitir enlace directo L2 con el USRP
-       sin perder acceso a Internet/DNS.
+    1) ⚡ Asignar enlace directo L2 a interfaz activa (Recomendado)
+       Detecta las interfaces físicas de red (ej. eth1) y asigna
+       la IP estática (192.168.10.4/24) para comunicación directa
+       con el USRP sin tocar el gateway de Internet en eth2.
        (Reversible en cualquier momento o al desinstalar).
 
     2) 📡 Reparar / Inicializar archivos RF para Preflight (channel-plan y safety-manifest)
        Genera o corrige channel-plan.yaml con las frecuencias DL/UL (2660/2540 MHz)
        y safety-manifest.yaml requeridos para aprobar rf_preflight en perfiles RF.
 
-    3) ℹ️  Ver explicación técnica y estado en modo NAT
+    3) 🔄 Configurar modo "Mirrored" en WSL2 (Avanzado)
+       Escribe 'networkingMode=mirrored' en %USERPROFILE%\.wslconfig.
+       (Nota: Si tu equipo tiene múltiples tarjetas puede afectar el DNS).
+
+    4) ℹ️  Ver explicación técnica y estado de red
 
     0) Cancelar / Volver
 
 EOF
-    read -rp "  Elige una opción [0-3]: " wopt
+    read -rp "  Elige una opción [0-4]: " wopt
     case "$wopt" in
       1)
+        echo
+        echo "  Interfaces de red disponibles en WSL2:"
+        local -a ifaces=()
+        local idx=1
+        local def_dev=""
+        def_dev="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+        for i in $(ip -o link show | awk -F': ' '{print $2}' | grep -vE "^lo$|^docker|^br-|^veth"); do
+          local c="0"
+          [ -r "/sys/class/net/$i/carrier" ] && c=$(cat "/sys/class/net/$i/carrier" 2>/dev/null || echo "0")
+          local note=""
+          [ "$i" = "$def_dev" ] && note=" [Gateway Internet/DNS actual]"
+          [ "$c" = "1" ] && [ "$i" != "$def_dev" ] && note=" [Carrier UP - Recomendada para USRP]"
+          printf "    %d) %-12s (Carrier: %s)%s\n" "$idx" "$i" "$c" "$note"
+          ifaces+=("$i")
+          idx=$((idx + 1))
+        done
+        if [ "${#ifaces[@]}" -eq 0 ]; then
+          echo "    (No se detectaron interfaces físicas)"
+          pause
+          return 0
+        fi
+        echo
+        read -rp "  Selecciona interfaz para enlace USRP X310 [1-${#ifaces[@]}]: " if_choice
+        if [[ "$if_choice" =~ ^[0-9]+$ ]] && [ "$if_choice" -ge 1 ] && [ "$if_choice" -le "${#ifaces[@]}" ]; then
+          local sel_if="${ifaces[$((if_choice - 1))]}"
+          local ip_to_add="192.168.10.4/24"
+          read -rp "  IP con prefijo CIDR a asignar [Enter = $ip_to_add]: " user_ip
+          user_ip="${user_ip:-$ip_to_add}"
+          sudo ip link set "$sel_if" up 2>/dev/null || true
+          show_cmd "Asignando IP" "sudo ip addr add $user_ip dev $sel_if"
+          if sudo ip addr add "$user_ip" dev "$sel_if" 2>/dev/null; then
+            mkdir -p "$LAIN5G_STATE"
+            cat <<EOF > "$X310_FIX_STATE"
+FIX_TYPE=direct_link
+DEV=$sel_if
+IP_CIDR=$user_ip
+DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+EOF
+            echo "  ✅ IP $user_ip asignada correctamente a $sel_if."
+            echo "     Enlace directo L2 activo sin afectar la salida a Internet."
+          else
+            # Si ya tenía la IP asignada, asegurar que guardamos el estado para reversión
+            mkdir -p "$LAIN5G_STATE"
+            cat <<EOF > "$X310_FIX_STATE"
+FIX_TYPE=direct_link
+DEV=$sel_if
+IP_CIDR=$user_ip
+DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+EOF
+            echo "  ℹ️  La interfaz $sel_if ya cuenta con la IP $user_ip."
+          fi
+        fi
+        detect_state
+        pause
+        ;;
+      2)
+        _setup_rf_preflight_files
+        pause
+        ;;
+      3)
         local win_user_prof=""
         if command -v powershell.exe &>/dev/null; then
           win_user_prof=$(powershell.exe -NoProfile -Command 'Write-Host -NoNewline $env:USERPROFILE' 2>/dev/null | tr -d '\r')
@@ -695,12 +758,6 @@ EOF
 
         if [ -z "$wsl_cfg_path" ]; then
           echo "  ❌ No se pudo localizar la carpeta de usuario de Windows desde WSL."
-          echo "     Por favor crea manualmente el archivo C:\\Users\\<TuUsuario>\\.wslconfig"
-          echo "     con el contenido:"
-          echo "       [wsl2]"
-          echo "       networkingMode=mirrored"
-          echo "       dnsTunneling=true"
-          echo "       autoProxy=true"
           pause
           return 0
         fi
@@ -713,32 +770,12 @@ EOF
           cp "$wsl_cfg_path" "$bak_path"
         fi
 
-        if [ "$existed" = "true" ]; then
-          if grep -qi "\[wsl2\]" "$wsl_cfg_path"; then
-            if grep -qi "networkingMode" "$wsl_cfg_path"; then
-              sed -i 's/networkingMode=.*/networkingMode=mirrored/gI' "$wsl_cfg_path"
-            else
-              sed -i '/\[wsl2\]/a networkingMode=mirrored' "$wsl_cfg_path"
-            fi
-            grep -qi "dnsTunneling" "$wsl_cfg_path" || sed -i '/\[wsl2\]/a dnsTunneling=true' "$wsl_cfg_path"
-            grep -qi "autoProxy" "$wsl_cfg_path" || sed -i '/\[wsl2\]/a autoProxy=true' "$wsl_cfg_path"
-          else
-            cat <<'CFG' >> "$wsl_cfg_path"
-
+        cat <<'CFG' > "$wsl_cfg_path"
 [wsl2]
 networkingMode=mirrored
 dnsTunneling=true
 autoProxy=true
 CFG
-          fi
-        else
-          cat <<'CFG' > "$wsl_cfg_path"
-[wsl2]
-networkingMode=mirrored
-dnsTunneling=true
-autoProxy=true
-CFG
-        fi
 
         cat <<EOF > "$X310_FIX_STATE"
 FIX_TYPE=wsl_mirrored
@@ -747,39 +784,26 @@ BACKUP_PATH=$bak_path
 ORIGINALLY_EXISTED=$existed
 DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 EOF
-        echo "  ✅ Archivo $wsl_cfg_path configurado con:"
-        echo "     - networkingMode=mirrored"
-        echo "     - dnsTunneling=true"
-        echo "     - autoProxy=true"
-        echo
-        echo "  ⚠️  PASO OBLIGATORIO PARA APLICAR EL MODO MIRRORED:"
-        echo "  1. Guarda tu trabajo y cierra esta terminal."
-        echo "  2. En PowerShell de Windows ejecuta:  wsl --shutdown"
-        echo "  3. Vuelve a abrir tu terminal Ubuntu en WSL2."
-        echo "     (WSL2 reflejará la interfaz física Ethernet 2 con enlace directo L2 e Internet intacto)."
+        echo "  ✅ Archivo $wsl_cfg_path configurado con networkingMode=mirrored."
         detect_state
         pause
         ;;
-      2)
-        _setup_rf_preflight_files
-        pause
-        ;;
-      3)
+      4)
         cat <<'HELP'
   Explicación técnica del enlace X310 en WSL2:
   ─────────────────────────────────────────────────────────────
-  1. En modo NAT por defecto:
-     - El tráfico hacia 192.168.10.2 viaja a través del gateway
-       virtual de Windows (172.20.192.1).
-     - El ping funciona, pero srsRAN/UHD para transmisión RF real
-       puede sufrir caídas de paquetes o jitter al cruzar la capa
-       NAT de Hyper-V.
-     - OpenLain5G advierte (WARNING) para proteger de pérdidas I/Q.
+  1. Enlace L2 directo con interfaces dedicadas (Recomendado):
+     - WSL2 dispone de interfaces separadas para la conexión de red
+       general (ej. eth2 con salida a Internet) y para el USRP
+       (ej. eth1 conectado al puerto Gigabit del X310).
+     - Al asignar 192.168.10.4/24 a eth1, el tráfico al USRP
+       (192.168.10.2) viaja en Capa 2 directo sin atravesar NAT
+       y sin interferir con la conexión a Internet de eth2.
 
-  2. En modo Mirrored (networkingMode=mirrored):
-     - Windows 11 comparte directamente sus adaptadores de red con Linux.
-     - Linux accede directamente a la interfaz física Ethernet 2.
-     - El chequeo ethernet_link pasa a PASS con rendimiento nativo.
+  2. Modo Mirrored:
+     - Comparte adaptadores de red con Windows de forma unificada.
+     - En configuraciones con múltiples adaptadores físicos activos,
+       puede desorientar la ruta por defecto o resolución DNS.
 
 HELP
         pause
