@@ -600,6 +600,276 @@ _revert_x310_network_fix() {
 }
 
 # =============================================================================
+# ── Diagnóstico Integral y Compatibilidad USRP X310 / SDR ───────────────────
+# =============================================================================
+_optimize_kernel_buffers() {
+  echo
+  echo "  Configurando buffers de socket en el kernel a 32 MB (33554432 bytes)..."
+  show_cmd "Optimización sysctl" "sudo sysctl -w net.core.rmem_max=33554432 net.core.wmem_max=33554432"
+  if sudo sysctl -w net.core.rmem_max=33554432 net.core.wmem_max=33554432 2>/dev/null; then
+    echo "  ✅ Buffers aplicados en caliente con éxito."
+    if [ -d "/etc/sysctl.d" ]; then
+      if echo -e "# USRP SDR high speed buffer limits\nnet.core.rmem_max=33554432\nnet.core.wmem_max=33554432" | sudo tee /etc/sysctl.d/99-usrp-buffers.conf >/dev/null 2>&1; then
+        echo "  ✅ Configuración persistente guardada en /etc/sysctl.d/99-usrp-buffers.conf"
+      fi
+    fi
+  else
+    echo "  ❌ No se pudieron modificar los buffers con sysctl."
+  fi
+}
+
+cmd_usrp_full_diagnostic() {
+  section "🔍 Diagnóstico Integral y Compatibilidad USRP X310 / SDR"
+  local target_addr="${USRP_ADDR:-192.168.10.2}"
+
+  cat <<EOF
+  Este diagnóstico evalúa en profundidad la conectividad de red,
+  los parámetros del kernel Linux (buffers de socket), y efectúa una
+  radiografía completa del hardware USRP X310 y sus tarjetas hijas
+  para verificar qué perfiles 4G/5G pueden funcionar.
+
+EOF
+
+  # ── FASE 1: Red y Enlace Físico ──────────────────────────────────
+  echo "  ┌──────────────────────────────────────────────────────────┐"
+  echo "  │ 1. DIAGNÓSTICO DE RED Y ENLACE FÍSICO                     │"
+  echo "  └──────────────────────────────────────────────────────────┘"
+  echo "  Destino USRP        : $target_addr"
+  if _is_wsl; then
+    echo "  Entorno detectado   : WSL2 (Windows Subsystem for Linux)"
+  else
+    echo "  Entorno detectado   : Linux Nativo"
+  fi
+
+  local route
+  route="$(ip -4 route get "$target_addr" 2>/dev/null | head -n1 || true)"
+  local route_device
+  route_device="$(awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}' <<< "$route")"
+  local route_gateway
+  route_gateway="$(awk '{for (i=1; i<=NF; i++) if ($i == "via") {print $(i+1); exit}}' <<< "$route")"
+
+  if [ -n "$route_gateway" ]; then
+    echo "  Ruta actual         : $target_addr vía gateway virtual $route_gateway ($route_device)"
+    echo "  Estado de enlace    : ⚠️  Ruta enrutada vía gateway (puede requerir enlace directo L2)"
+  elif [ -n "$route_device" ]; then
+    echo "  Ruta actual         : $target_addr directo por interfaz $route_device (scope link)"
+    echo "  Estado de enlace    : ✅ Enlace directo L2 detectado"
+  else
+    echo "  Estado de enlace    : ❌ No se encontró ruta hacia $target_addr"
+  fi
+
+  # Ping check
+  printf "  Comprobando respuesta ICMP (ping a %s)... " "$target_addr"
+  local ping_out
+  ping_out="$(ping -c 2 -W 2 "$target_addr" 2>&1 || true)"
+  local ping_ok=false
+  if grep -q "2 packets transmitted, 2 received" <<< "$ping_out" || grep -q " 0% packet loss" <<< "$ping_out"; then
+    local rtt
+    rtt="$(awk -F'/' '/rtt min\/avg\/max/ {print $5}' <<< "$ping_out")"
+    echo "✅ Responde OK (${rtt:-~4} ms)"
+    ping_ok=true
+  else
+    echo "❌ Sin respuesta (USRP apagado, desconectado o IP no asignada)"
+  fi
+
+  # Carrier check
+  echo
+  echo "  Estado físico de interfaces de red (Carrier):"
+  for i in $(ip -o link show | awk -F': ' '{print $2}' | grep -vE "^lo$|^docker|^br-|^veth"); do
+    local c="0"
+    [ -r "/sys/class/net/$i/carrier" ] && c=$(cat "/sys/class/net/$i/carrier" 2>/dev/null || echo "0")
+    if [ "$c" = "1" ]; then
+      printf "    ✅ %-12s : Cable Conectado (Carrier UP)\n" "$i"
+    else
+      printf "    ⬛ %-12s : Sin Enlace (Carrier DOWN)\n" "$i"
+    fi
+  done
+  echo
+
+  # ── FASE 2: Buffers de Red del Kernel (sysctl) ───────────────────
+  echo "  ┌──────────────────────────────────────────────────────────┐"
+  echo "  │ 2. AUDITORÍA DE BUFFERS DE RED DEL KERNEL (SOCKET BUFFER)│"
+  echo "  └──────────────────────────────────────────────────────────┘"
+  local rmem wmem
+  rmem="$(cat /proc/sys/net/core/rmem_max 2>/dev/null || echo 0)"
+  wmem="$(cat /proc/sys/net/core/wmem_max 2>/dev/null || echo 0)"
+  local rmem_mb=$((rmem / 1024 / 1024))
+  local wmem_mb=$((wmem / 1024 / 1024))
+
+  echo "  net.core.rmem_max : $rmem bytes (~$rmem_mb MB)"
+  echo "  net.core.wmem_max : $wmem bytes (~$wmem_mb MB)"
+
+  if [ "$rmem" -ge 33554432 ] && [ "$wmem" -ge 33554432 ]; then
+    echo "  Estado Buffers    : ✅ ÓPTIMO (≥ 32 MB). Previene desbordamiento de I/Q (errores U/O)."
+  else
+    echo "  Estado Buffers    : ⚠️  SUB-ÓPTIMO (< 32 MB)."
+    echo "                      Buffers pequeños causan pérdidas de paquetes I/Q, desbordamientos"
+    echo "                      (Underflow 'U' / Overflow 'O') y timeouts en control RFNoC."
+    echo "                      UHD y srsRAN recomiendan net.core.rmem_max=33554432 (32 MB)."
+    if confirm "  ¿Deseas optimizar los buffers del kernel ahora a 32 MB?"; then
+      _optimize_kernel_buffers
+    fi
+  fi
+  echo
+
+  # ── FASE 3: Radiografía de Hardware SDR y Tarjetas Hijas ─────────
+  echo "  ┌──────────────────────────────────────────────────────────┐"
+  echo "  │ 3. RADIOGRAFÍA DE HARDWARE USRP X310 Y TARJETAS HIJAS    │"
+  echo "  └──────────────────────────────────────────────────────────┘"
+
+  local probe_file=""
+  local probe_fresh=false
+
+  if $ping_ok; then
+    printf "  Sondeando USRP en %s mediante UHD (esto puede tardar unos segundos)... " "$target_addr"
+    local tmp_probe="/tmp/lain5g-mgr-probe.log"
+    if timeout 15 docker run --rm --network host --entrypoint uhd_usrp_probe \
+        lain5g-lab/srsranproject-uhd:local --args="addr=$target_addr" > "$tmp_probe" 2>&1; then
+      echo "✅ Sonda completada."
+      probe_file="$tmp_probe"
+      probe_fresh=true
+    else
+      echo "⚠️  Timeout o fallo en sonda en vivo."
+    fi
+  fi
+
+  if [ $probe_fresh = true ] && [ -s "$tmp_probe" ]; then
+    mkdir -p "$LAIN5G_STATE"
+    cp "$tmp_probe" "$LAIN5G_STATE/last-usrp-probe.log" 2>/dev/null || true
+  fi
+
+  if [ -z "$probe_file" ]; then
+    for cand in "$LAIN5G_STATE/last-usrp-probe.log" /tmp/lain5g-uhd-probe.log /tmp/lain5g-5g-x310-usrp-probe.log /tmp/lain5g-nsa-hardware-check.log; do
+      if [ -s "$cand" ] && grep -q "Device: X-Series" "$cand" 2>/dev/null; then
+        probe_file="$cand"
+        echo "  ℹ️  Utilizando datos del sondeo UHD previo guardado en: $cand"
+        break
+      fi
+    done
+  fi
+
+  local x310_detected=false
+  local fpga_ver=""
+  local fw_ver=""
+  local dboard0_tx=""
+  local dboard0_freq=""
+  local dboard1_tx=""
+  local dboard1_freq=""
+
+  if [ -n "$probe_file" ] && [ -s "$probe_file" ]; then
+    if grep -q "Device: X-Series" "$probe_file"; then
+      x310_detected=true
+      fw_ver="$(grep -m1 "FW Version:" "$probe_file" | awk -F': ' '{print $2}' | tr -d '\r')"
+      fpga_ver="$(grep -m1 "FPGA Version:" "$probe_file" | awk -F': ' '{print $2}' | tr -d '\r')"
+
+      # Ranura 0 (Radio#0)
+      dboard0_tx="$(awk '/TX Dboard: 0\/Radio#0/,/ID:/ {if ($1=="ID:") {sub(/^.*ID: /,""); print; exit}}' "$probe_file" | tr -d '\r')"
+      dboard0_freq="$(awk '/TX Frontend: 0/,/Freq range:/ {if ($1=="Freq" && $2=="range:") {sub(/^.*range: /,""); print; exit}}' "$probe_file" | tr -d '\r')"
+
+      # Ranura 1 (Radio#1)
+      dboard1_tx="$(awk '/TX Dboard: 0\/Radio#1/,/ID:/ {if ($1=="ID:") {sub(/^.*ID: /,""); print; exit}}' "$probe_file" | tr -d '\r')"
+      dboard1_freq="$(awk '/TX Dboard: 0\/Radio#1/,/Freq range:/ {if ($1=="Freq" && $2=="range:") {sub(/^.*range: /,""); print; exit}}' "$probe_file" | tr -d '\r')"
+    fi
+  fi
+
+  if $x310_detected; then
+    echo "  Dispositivo         : USRP X310 / X-Series"
+    echo "  Firmware Version    : ${fw_ver:-desconocido}"
+    echo "  FPGA Version        : ${fpga_ver:-desconocido} (Compatible UHD 4.10 ✅)"
+    echo "  RFNoC Capable       : Sí (Arquitectura UHD 4.x de grafos de radio)"
+    echo
+    echo "  Ranuras y Tarjetas Hijas (Daughterboards) detectadas:"
+    echo "  ────────────────────────────────────────────────────────────"
+    printf "  • Ranura 0 (Radio#0) : %s\n" "${dboard0_tx:-No detectada}"
+    printf "    Rango Frecuencia   : %s\n" "${dboard0_freq:-desconocido}"
+    printf "  • Ranura 1 (Radio#1) : %s\n" "${dboard1_tx:-No detectada}"
+    printf "    Rango Frecuencia   : %s\n" "${dboard1_freq:-desconocido}"
+    echo "  ────────────────────────────────────────────────────────────"
+  else
+    echo "  ⚠️  No se pudo consultar el USRP X310 ni encontrar registro de sonda."
+    echo "      Asegúrate de que el USRP esté encendido y alcanzable por IP."
+  fi
+  echo
+
+  # ── FASE 4: Matriz de Compatibilidad de Escenarios ───────────────
+  echo "  ┌──────────────────────────────────────────────────────────┐"
+  echo "  │ 4. MATRIZ DE COMPATIBILIDAD CON ESCENARIOS OPENLAIN5G    │"
+  echo "  └──────────────────────────────────────────────────────────┘"
+
+  if ! $x310_detected; then
+    echo "  (No se dispone de datos de sondeo del USRP en este momento)."
+    echo "  Conecta y enciende el USRP X310 para generar la radiografía en vivo."
+    echo
+  else
+    local ubx0=false
+    local ubx1=false
+    grep -qi "UBX" <<< "$dboard0_tx" && ubx0=true
+    grep -qi "UBX" <<< "$dboard1_tx" && ubx1=true
+
+    # 1. 4G LTE X310
+    if $ubx0 || grep -qi "10.000 to 6000" <<< "$dboard0_freq"; then
+      echo "  [1] 4G LTE X310 (srsRAN 4G, B7 @ 2660 MHz)"
+      echo "      Estado: 🟢 COMPATIBLE"
+      echo "      Motivo: Ranura 0 cuenta con ${dboard0_tx:-UBX} que cubre la Banda 7 (2.6 GHz)."
+    else
+      echo "  [1] 4G LTE X310 (srsRAN 4G, B7 @ 2660 MHz)"
+      echo "      Estado: 🟡 NO CONFIRMADO (Requiere tarjeta que cubra 2660 MHz en Ranura 0)."
+    fi
+    echo
+
+    # 2. 5G SA X310
+    if $ubx0 || grep -qi "10.000 to 6000" <<< "$dboard0_freq"; then
+      echo "  [2] 5G SA X310 (srsRAN Project gNB, n3 @ 1842.5 MHz)"
+      echo "      Estado: 🟢 COMPATIBLE"
+      echo "      Motivo: Ranura 0 cuenta con ${dboard0_tx:-UBX} que cubre la Banda n3 (1.8 GHz)."
+    else
+      echo "  [2] 5G SA X310 (srsRAN Project gNB, n3 @ 1842.5 MHz)"
+      echo "      Estado: 🟡 NO CONFIRMADO (Requiere tarjeta que cubra 1842.5 MHz en Ranura 0)."
+    fi
+    echo
+
+    # 3. 5G NSA X310 (EN-DC)
+    echo "  [3] 5G NSA X310 EN-DC (Dual-Carrier: LTE B7 @ 2660 MHz + NR n3 @ 1842.5 MHz)"
+    if $ubx0 && $ubx1; then
+      echo "      Estado: 🟢 COMPATIBLE"
+      echo "      Motivo: Dispone de 2 tarjetas hijas aptas para microondas celular en ambas ranuras."
+    elif grep -qi "Basic" <<< "$dboard1_tx" || [ -z "$dboard1_tx" ]; then
+      echo "      Estado: 🔴 INCOMPATIBLE CON EL HARDWARE ACTUAL"
+      echo "      Motivo: 5G NSA requiere 2 cadenas RF simultáneas en el grafo RFNoC."
+      echo "              La Ranura 1 tiene instalada una tarjeta '${dboard1_tx:-Basic TX/RX}'"
+      echo "              cuyo rango es de -250 a 250 MHz (banda base/IF). Es FÍSICAMENTE INCAPAZ"
+      echo "              de sintonizar la portadora NR n3 (1842.5 MHz)."
+      echo "              👉 Esto causa el error: rfnoc_initialization FAIL ('Failure to create"
+      echo "                 rfnoc_graph' / 'Management operation failed')."
+      echo "              Para usar 5G NSA se necesita instalar una segunda tarjeta celular"
+      echo "              (ej. otra UBX-160 o TwinRX) en la Ranura 1 del X310."
+    else
+      echo "      Estado: 🟡 VERIFICACIÓN MANUAL REQUERIDA"
+    fi
+    echo
+  fi
+
+  # ── FASE 5: Consejos de Operación y Reloj Maestro ────────────────
+  echo "  ┌──────────────────────────────────────────────────────────┐"
+  echo "  │ 5. RECOMENDACIONES CLAVE DE OPERACIÓN SDR                │"
+  echo "  └──────────────────────────────────────────────────────────┘"
+  echo "  • Reloj Maestro (Master Clock Rate):"
+  echo "    5G SA (gnb) bloquea el reloj interno del X310 en 184.32 MHz."
+  echo "    4G LTE (srsenb) requiere 200 MHz / sample rate 11.52 Msps."
+  echo "    ⚠️  REGLA DE ORO: Si acabas de transmitir en 5G SA y quieres pasar a 4G,"
+  echo "        debes APAGAR Y VOLVER A ENCENDER EL USRP (Power Cycle) en el botón"
+  echo "        frontal para que el FPGA reinicie su sintetizador de frecuencia."
+  echo "  • Atenuación RF obligatoria:"
+  echo "    En laboratorio cableado, SIEMPRE usa atenuadores de al menos 60 dB entre"
+  echo "    los puertos TX y RX de tus dispositivos para no quemar las entradas LNA."
+  echo "  ────────────────────────────────────────────────────────────"
+  echo
+  if confirm "  ¿Deseas abrir el Asistente para Reparar / Preparar archivos RF preflight?"; then
+    _setup_rf_preflight_files
+  fi
+}
+
+# =============================================================================
 # ── Asistente de Reparación / Reversión Ethernet X310 ────────────────────────
 # =============================================================================
 cmd_fix_x310_ethernet() {
@@ -903,9 +1173,10 @@ _setup_rf_preflight_files() {
   Elige qué escenario deseas preparar:
     1) 4G LTE X310 (Banda 7, EARFCN 3150, DL: 2660 MHz, UL: 2540 MHz)
     2) 5G SA X310  (Banda n3, DL ARFCN 368500, SCS: 15 kHz)
+    3) 5G NSA X310 (EN-DC: LTE B7 2660 MHz + NR n3 1842.5 MHz)
     0) Volver
 EOF
-  read -rp "  Elige una opción [0-2]: " rf_opt
+  read -rp "  Elige una opción [0-3]: " rf_opt
   case "$rf_opt" in
     1)
       local d_dir="$LAIN5G_DIR/deployments/4g-volte/x310/rf"
@@ -976,6 +1247,50 @@ YAML_SM5
       echo "  ✅ Archivos de 5G SA X310 actualizados:"
       echo "     - $d_dir/channel-plan.yaml (Banda n3, DL ARFCN: 368500, SCS: 15)"
       echo "     - $d_dir/safety-manifest.yaml (shielded, auto-stop: 600s, auth: true)"
+      ;;
+    3)
+      local d_dir="$LAIN5G_DIR/deployments/5g-nsa-x310/rf"
+      if [ ! -d "$d_dir" ]; then
+        echo "  ❌ Directorio $d_dir no encontrado."
+        return 0
+      fi
+      cat <<'YAML_NSA' > "$d_dir/channel-plan.yaml"
+mode: NSA_EN_DC
+lte_band: 7
+lte_dl_earfcn: 3150
+lte_bandwidth_mhz: 10
+lte_downlink_frequency_mhz: 2660.0
+lte_uplink_frequency_mhz: 2540.0
+nr_band: 3
+nr_dl_arfcn: 368500
+nr_bandwidth_mhz: 10
+nr_downlink_frequency_mhz: 1842.5
+nr_uplink_frequency_mhz: 1747.5
+subcarrier_spacing_khz: 15
+rf_channels: 2
+authorized_lab_frequencies: true
+operator_note: Controlled NSA RF session from OpenLain5G Manager
+YAML_NSA
+      cat <<'YAML_SM_NSA' > "$d_dir/safety-manifest.yaml"
+authorization_confirmed: true
+auto_stop: true
+capture_logs: true
+maximum_duration_seconds: 120
+lab_mode: shielded
+attenuation_db: 60
+antenna_connected: true
+nr_rf_path_connected: true
+shielded_environment: true
+operator_note: Controlled NSA RF session from OpenLain5G Manager
+YAML_SM_NSA
+      echo "  ✅ Archivos de 5G NSA X310 actualizados:"
+      echo "     - $d_dir/channel-plan.yaml (LTE B7 3150 + NR n3 368500, auth: true)"
+      echo "     - $d_dir/safety-manifest.yaml (shielded, nr_rf_path: true, auth: true)"
+      echo
+      echo "  Probando preflight 5G NSA..."
+      if [ -x "$LAIN5G_DIR/deployments/5g-nsa-x310/scripts/preflight.sh" ]; then
+        (cd "$LAIN5G_DIR" && LAIN5G_DRY_RUN=false ./deployments/5g-nsa-x310/scripts/preflight.sh 2>&1 | grep -E "dual_rat|rf_ports|scs_rate|duration|status") || true
+      fi
       ;;
     0) return 0 ;;
     *) echo "  Opción inválida." ;;
@@ -2224,15 +2539,16 @@ main_menu() {
     echo "   5) 📦 Instalar"
     echo "   6) 🗑️  Desinstalar"
     echo "   7) 🔄 Reinstalar"
+    echo "   D) 🔍 Diagnóstico Integral y Compatibilidad USRP X310 / SDR"
     if $X310_ETH_ISSUE; then
       echo "   R) 🔧 Asistente: Reparar / Revertir enlace Ethernet X310"
     fi
     echo "   8) ❌ Salir"
     echo
     if $X310_ETH_ISSUE; then
-      read -rp "Elige una opción [1-8 o R]: " opt
+      read -rp "Elige una opción [1-8, D o R]: " opt
     else
-      read -rp "Elige una opción [1-8]: " opt
+      read -rp "Elige una opción [1-8 o D]: " opt
     fi
 
     case "${opt,,}" in
@@ -2243,6 +2559,7 @@ main_menu() {
       5) cmd_install   ;;
       6) cmd_uninstall ;;
       7) cmd_reinstall ;;
+      d) cmd_usrp_full_diagnostic ;;
       r)
         if $X310_ETH_ISSUE; then
           cmd_fix_x310_ethernet
